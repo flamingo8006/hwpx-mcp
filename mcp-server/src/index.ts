@@ -1296,6 +1296,44 @@ batch_fill_table({
     },
   },
   {
+    name: 'get_numbering_defs',
+    description: 'Get available numbering (ordered list) definitions from the document',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        doc_id: { type: 'string', description: 'Document ID' },
+      },
+      required: ['doc_id'],
+    },
+  },
+  {
+    name: 'get_bullet_defs',
+    description: 'Get available bullet (unordered list) definitions from the document',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        doc_id: { type: 'string', description: 'Document ID' },
+      },
+      required: ['doc_id'],
+    },
+  },
+  {
+    name: 'set_numbering',
+    description: 'Apply numbering (ordered) or bullet (unordered) list style to a paragraph. Use get_numbering_defs/get_bullet_defs first to find available definitions.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        doc_id: { type: 'string', description: 'Document ID' },
+        section_index: { type: 'number', description: 'Section index' },
+        paragraph_index: { type: 'number', description: 'Paragraph index (element index)' },
+        heading_type: { type: 'string', enum: ['number', 'bullet'], description: '"number" for ordered list, "bullet" for unordered list' },
+        def_id: { type: 'number', description: 'Numbering or bullet definition ID (from get_numbering_defs or get_bullet_defs)' },
+        level: { type: 'number', description: 'Numbering level (0-based, default 0)' },
+      },
+      required: ['doc_id', 'section_index', 'paragraph_index', 'heading_type', 'def_id'],
+    },
+  },
+  {
     name: 'set_cell_background_color',
     description: 'Set background color for a table cell (HWPX only). Creates borderFill definition and updates cell reference.',
     inputSchema: {
@@ -2258,6 +2296,7 @@ const READ_ONLY_TOOLS = new Set([
   'find_insert_position_after_table', 'find_cell_by_label',
   'search_chunks', 'extract_toc',
   'build_position_index',
+  'get_numbering_defs', 'get_bullet_defs',
 ]);
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
@@ -3688,6 +3727,34 @@ Call get_tool_guide with: template, table, image, search, read, create`
         );
         if (!result) return error('Failed to insert table');
         return success({ message: 'Table inserted', tableIndex: result.tableIndex });
+      }
+
+      case 'get_numbering_defs': {
+        const doc = getDoc(args?.doc_id as string);
+        if (!doc) return error('Document not found');
+        return success({ numberings: doc.getNumberingDefs() });
+      }
+
+      case 'get_bullet_defs': {
+        const doc = getDoc(args?.doc_id as string);
+        if (!doc) return error('Document not found');
+        return success({ bullets: doc.getBulletDefs() });
+      }
+
+      case 'set_numbering': {
+        const doc = getDoc(args?.doc_id as string);
+        if (!doc) return error('Document not found');
+        if (doc.format === 'hwp') return error('HWP files are read-only');
+
+        const result = doc.setNumbering(
+          args?.section_index as number,
+          args?.paragraph_index as number,
+          args?.heading_type as 'number' | 'bullet',
+          args?.def_id as number,
+          args?.level as number ?? 0
+        );
+        if (!result) return error('Failed to set numbering (invalid paragraph)');
+        return success({ message: 'Numbering style applied' });
       }
 
       case 'set_cell_background_color': {

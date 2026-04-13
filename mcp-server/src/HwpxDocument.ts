@@ -20,6 +20,7 @@ import type {
   PendingTableColumnInsert, PendingTableColumnDelete,
   PendingParagraphCopy, PendingParagraphMove, PendingHeaderFooterUpdate,
   PendingTableMove, PendingColumnWidthUpdate, PendingCellStyleUpdate,
+  PendingNumberingUpdate,
 } from './types/operations';
 import {
   HwpxContent,
@@ -146,6 +147,7 @@ export class HwpxDocument {
   private _pendingFooterUpdates: PendingHeaderFooterUpdate[] = [];
   private _pendingColumnWidthUpdates: PendingColumnWidthUpdate[] = [];
   private _pendingCellStyleUpdates: PendingCellStyleUpdate[] = [];
+  private _pendingNumberingUpdates: PendingNumberingUpdate[] = [];
 
   // Cache for character properties (id → font size in pt)
   private _charPrCache: Map<number, number> | null = null;
@@ -441,6 +443,7 @@ export class HwpxDocument {
     this._pendingRunSplits = [];
     this._pendingColumnWidthUpdates = [];
     this._pendingCellStyleUpdates = [];
+    this._pendingNumberingUpdates = [];
     this._pendingTableRowInserts = [];
     this._pendingTableRowDeletes = [];
     this._pendingTableColumnInserts = [];
@@ -2728,6 +2731,61 @@ export class HwpxDocument {
   }
 
   /**
+   * Get available numbering definitions from the document.
+   */
+  getNumberingDefs(): Array<{ id: number; start?: number; levels: Array<{ level: number; format: string; text?: string }> }> {
+    const result: Array<{ id: number; start?: number; levels: Array<{ level: number; format: string; text?: string }> }> = [];
+    if (this._content.styles?.numberings) {
+      for (const [, def] of this._content.styles.numberings) {
+        result.push({
+          id: def.id,
+          start: def.start,
+          levels: def.paraHeads.map(h => ({ level: h.level, format: h.numFormat || 'digit', text: h.text })),
+        });
+      }
+    }
+    return result;
+  }
+
+  /**
+   * Get available bullet definitions from the document.
+   */
+  getBulletDefs(): Array<{ id: number; char?: string }> {
+    const result: Array<{ id: number; char?: string }> = [];
+    if (this._content.styles?.bullets) {
+      for (const [, def] of this._content.styles.bullets) {
+        result.push({ id: def.id, char: def.char });
+      }
+    }
+    return result;
+  }
+
+  /**
+   * Apply numbering or bullet style to a paragraph.
+   * @param headingType 'number' for ordered numbering, 'bullet' for bullet list
+   * @param defId ID of the numbering or bullet definition (from getNumberingDefs/getBulletDefs)
+   * @param level Numbering level (0-based, default 0)
+   */
+  setNumbering(sectionIndex: number, elementIndex: number, headingType: 'number' | 'bullet', defId: number, level: number = 0): boolean {
+    const paragraph = this.findParagraphByPath(sectionIndex, elementIndex);
+    if (!paragraph) return false;
+
+    this.saveState();
+
+    this._pendingNumberingUpdates.push({
+      sectionIndex,
+      elementIndex,
+      paragraphId: paragraph.id,
+      headingType,
+      numberingId: defId,
+      level,
+    });
+
+    this.markModified();
+    return true;
+  }
+
+  /**
    * Set background color for a table cell.
    * Creates a new borderFill in header.xml and updates the cell's borderFillIDRef.
    * @param backgroundColor Hex color string (e.g. "FFFF00" for yellow)
@@ -4800,6 +4858,12 @@ export class HwpxDocument {
       this._pendingParagraphInserts = [];
     }
 
+    // Apply numbering updates
+    if (this._pendingNumberingUpdates && this._pendingNumberingUpdates.length > 0) {
+      await this.applyNumberingUpdatesToXml();
+      this._pendingNumberingUpdates = [];
+    }
+
     // Apply cell style updates (background color via borderFill)
     if (this._pendingCellStyleUpdates && this._pendingCellStyleUpdates.length > 0) {
       await this.applyCellStyleUpdatesToXml();
@@ -6383,6 +6447,126 @@ export class HwpxDocument {
    * - Validates XML structure after changes
    * - Reverts to original if validation fails
    */
+  /**
+   * Apply numbering/bullet updates to XML.
+   * Creates new paraPr with heading element and updates paragraph's paraPrIDRef.
+   */
+  private async applyNumberingUpdatesToXml(): Promise<void> {
+    if (!this._zip || this._pendingNumberingUpdates.length === 0) return;
+
+    const headerPath = 'Contents/header.xml';
+    let headerXml = await this._zip.file(headerPath)?.async('string');
+    if (!headerXml) return;
+
+    // Find max paraPr id
+    let maxParaPrId = 0;
+    const paraPrIdRegex = /<hh:paraPr[^>]*\sid="(\d+)"/g;
+    let idMatch: RegExpExecArray | null;
+    while ((idMatch = paraPrIdRegex.exec(headerXml)) !== null) {
+      maxParaPrId = Math.max(maxParaPrId, parseInt(idMatch[1], 10));
+    }
+
+    // Dedup: same headingType + defId + level → same paraPr
+    const keyToId = new Map<string, number>();
+    const newParaPrs: string[] = [];
+
+    // Group updates by section
+    const updatesBySection = new Map<number, PendingNumberingUpdate[]>();
+    for (const update of this._pendingNumberingUpdates) {
+      const list = updatesBySection.get(update.sectionIndex) || [];
+      list.push(update);
+      updatesBySection.set(update.sectionIndex, list);
+
+      // Defer paraPr creation until we know the original paraPrIDRef from section XML
+      // (handled in the section processing loop below)
+    }
+
+    // Process each section: find original paraPrIDRef, clone, add heading, update reference
+    for (const [sectionIndex, updates] of updatesBySection) {
+      const sectionPath = `Contents/section${sectionIndex}.xml`;
+      const file = this._zip.file(sectionPath);
+      if (!file) continue;
+
+      let xml = await file.async('string');
+
+      // Process in reverse to avoid offset shifting
+      const sortedUpdates = [...updates].sort((a, b) => b.elementIndex - a.elementIndex);
+
+      for (const update of sortedUpdates) {
+        const topElements = this.findTopLevelElements(xml);
+        if (update.elementIndex >= topElements.length) continue;
+
+        const elem = topElements[update.elementIndex];
+        if (elem.type !== 'p') continue;
+
+        // Get original paraPrIDRef
+        const origIdMatch = elem.content.match(/paraPrIDRef="(\d+)"/);
+        const origParaPrId = origIdMatch ? origIdMatch[1] : '0';
+
+        // Dedup key includes original paraPr + numbering params
+        const key = `orig:${origParaPrId}-${update.headingType}-${update.numberingId}-${update.level}`;
+
+        if (!keyToId.has(key)) {
+          maxParaPrId++;
+          keyToId.set(key, maxParaPrId);
+
+          const headingTypeXml = update.headingType === 'number' ? 'NUMBER' : 'BULLET';
+          const headingElement = `<hh:heading type="${headingTypeXml}" idRef="${update.numberingId}" level="${update.level}"/>`;
+
+          // Try to clone original paraPr
+          const origParaPrRegex = new RegExp(
+            `<hh:paraPr\\s+[^>]*id="${origParaPrId}"[^>]*>[\\s\\S]*?</hh:paraPr>`
+          );
+          const origMatch = origParaPrRegex.exec(headerXml);
+
+          if (origMatch) {
+            let cloned = origMatch[0].replace(/id="\d+"/, `id="${maxParaPrId}"`);
+            // Replace or add heading element
+            if (/<hh:heading[^>]*\/>/.test(cloned) || /<hh:heading[^>]*>/.test(cloned)) {
+              cloned = cloned.replace(/<hh:heading[^/]*\/>|<hh:heading[^>]*>[^<]*<\/hh:heading>/, headingElement);
+            } else {
+              cloned = cloned.replace('</hh:paraPr>', headingElement + '</hh:paraPr>');
+            }
+            newParaPrs.push(cloned);
+          } else {
+            // Fallback: minimal paraPr
+            newParaPrs.push(`      <hh:paraPr id="${maxParaPrId}" tabPrIDRef="0">
+        <hh:align horizontal="LEFT" vertical="BASELINE"/>
+        ${headingElement}
+      </hh:paraPr>`);
+          }
+        }
+
+        const newParaPrId = keyToId.get(key)!;
+        const updatedContent = elem.content.replace(
+          /paraPrIDRef="\d+"/,
+          `paraPrIDRef="${newParaPrId}"`
+        );
+        xml = xml.substring(0, elem.start) +
+          updatedContent +
+          xml.substring(elem.start + elem.tagLength);
+      }
+
+      this._zip.file(sectionPath, xml);
+    }
+
+    // Insert new paraPr into header.xml
+    if (newParaPrs.length > 0) {
+      const insertPos = headerXml.lastIndexOf('</hh:paraProperties>');
+      if (insertPos >= 0) {
+        headerXml = headerXml.slice(0, insertPos) +
+          '\n' + newParaPrs.join('\n') + '\n' +
+          headerXml.slice(insertPos);
+
+        headerXml = headerXml.replace(
+          /<hh:paraProperties\s+itemCnt="(\d+)"/,
+          (_m: string, cnt: string) => `<hh:paraProperties itemCnt="${parseInt(cnt, 10) + newParaPrs.length}"`
+        );
+      }
+      this._zip.file(headerPath, headerXml);
+    }
+  }
+
   /**
    * Apply cell style updates (background color) to XML.
    * Creates new borderFill definitions in header.xml and updates cell borderFillIDRef.
@@ -12584,54 +12768,7 @@ export class HwpxDocument {
       if (!sectionXml) continue;
 
       for (const update of updates) {
-        // Create style key for deduplication (includes all style attributes)
-        const fontSize = update.style.fontSize ? Math.round(update.style.fontSize * 100) : 1000;
-        const fontName = update.style.fontName || '함초롬바탕';
-        const bold = update.style.bold ? '1' : '0';
-        const italic = update.style.italic ? '1' : '0';
-        const underline = update.style.underline ? '1' : '0';
-        const strikethrough = update.style.strikethrough ? '1' : '0';
-        const fontColor = update.style.fontColor || '000000';
-        const backgroundColor = update.style.backgroundColor || 'none';
-        const styleKey = `${fontName}-${fontSize}-${bold}-${italic}-${underline}-${strikethrough}-${fontColor}-${backgroundColor}`;
-
-        let charPrId: number;
-        if (styleToIdMap.has(styleKey)) {
-          charPrId = styleToIdMap.get(styleKey)!;
-        } else {
-          charPrId = ++maxCharPrId;
-          styleToIdMap.set(styleKey, charPrId);
-
-          // Build fontRef with numeric IDs
-          const fontRefParts: string[] = [];
-          for (const [lang, attr] of Object.entries(langToAttr)) {
-            const fontMap = langToFontMap.get(lang);
-            const fontId = fontMap?.get(fontName) ?? 0;
-            fontRefParts.push(`${attr}="${fontId}"`);
-          }
-          const fontRefStr = `<hh:fontRef ${fontRefParts.join(' ')}/>`;
-
-          // Build style tags
-          const styleTags: string[] = [];
-          if (bold === '1') styleTags.push('<hh:bold/>');
-          if (italic === '1') styleTags.push('<hh:italic/>');
-          if (underline === '1') styleTags.push('<hh:underline/>');
-          if (strikethrough === '1') styleTags.push('<hh:strikeout/>');
-          const styleTagsStr = styleTags.length > 0 ? '\n        ' + styleTags.join('\n        ') : '';
-
-          // Build textColor and shadeColor
-          const textColorAttr = `#${fontColor}`;
-          const shadeColorAttr = backgroundColor === 'none' ? 'none' : `#${backgroundColor}`;
-
-          const charPr = `      <hh:charPr id="${charPrId}" height="${fontSize}" textColor="${textColorAttr}" shadeColor="${shadeColorAttr}" useFontSpace="0" useKerning="0" symMark="NONE" borderFillIDRef="1">
-        ${fontRefStr}
-        ${baseInnerXml}${styleTagsStr}
-      </hh:charPr>`;
-          newCharPrs.push(charPr);
-        }
-
-        // Update section XML - find the paragraph and update run's charPrIDRef
-        // Uses depth-aware helper to only match top-level elements
+        // Find the target paragraph and run to get the original charPrIDRef
         const allTopElements = this.findTopLevelElements(sectionXml);
         let targetParagraphStart = -1;
         let targetParagraphEnd = -1;
@@ -12640,7 +12777,6 @@ export class HwpxDocument {
           const elem = allTopElements[update.elementIndex];
           if (elem.type === 'p') {
             targetParagraphStart = elem.start;
-            // Find end of this paragraph - need to find matching close tag
             const prefixMatch = elem.content.match(/<(hp|hs):p/);
             const pPrefix = prefixMatch ? prefixMatch[1] : 'hp';
             const closeTag = `</${pPrefix}:p>`;
@@ -12648,25 +12784,130 @@ export class HwpxDocument {
           }
         }
 
-        if (targetParagraphStart >= 0 && targetParagraphEnd > targetParagraphStart) {
-          let paraXml = sectionXml.slice(targetParagraphStart, targetParagraphEnd);
+        if (targetParagraphStart < 0 || targetParagraphEnd <= targetParagraphStart) continue;
 
-          // Find and update the run at runIndex
-          const runRegex = /<hp:run\s+charPrIDRef="(\d+)"/g;
-          let runCount = 0;
-          let runMatch;
-          while ((runMatch = runRegex.exec(paraXml)) !== null) {
-            if (runCount === update.runIndex) {
-              const oldAttr = runMatch[0];
-              const newAttr = `<hp:run charPrIDRef="${charPrId}"`;
-              paraXml = paraXml.slice(0, runMatch.index) + newAttr + paraXml.slice(runMatch.index + oldAttr.length);
-              break;
-            }
-            runCount++;
+        let paraXml = sectionXml.slice(targetParagraphStart, targetParagraphEnd);
+
+        // Find the target run's original charPrIDRef
+        const runRegex = /<hp:run\s[^>]*charPrIDRef="(\d+)"[^>]*/g;
+        let runCount = 0;
+        let runMatch;
+        let origCharPrIDRef = '0';
+        while ((runMatch = runRegex.exec(paraXml)) !== null) {
+          if (runCount === update.runIndex) {
+            origCharPrIDRef = runMatch[1];
+            break;
           }
-
-          sectionXml = sectionXml.slice(0, targetParagraphStart) + paraXml + sectionXml.slice(targetParagraphEnd);
+          runCount++;
         }
+
+        // Clone the original charPr and apply style overlay
+        const origCharPrRegex = new RegExp(
+          `<hh:charPr\\s+[^>]*id="${origCharPrIDRef}"[^>]*>[\\s\\S]*?</hh:charPr>`,
+        );
+        const origCharPrMatch = origCharPrRegex.exec(headerXml);
+
+        // Build a dedup key that includes origCharPrIDRef + style overlay
+        const styleKey = `orig:${origCharPrIDRef}-` + JSON.stringify(update.style);
+
+        let charPrId: number;
+        if (styleToIdMap.has(styleKey)) {
+          charPrId = styleToIdMap.get(styleKey)!;
+        } else {
+          charPrId = ++maxCharPrId;
+          styleToIdMap.set(styleKey, charPrId);
+
+          if (origCharPrMatch) {
+            // Clone and modify
+            let clonedCharPr = origCharPrMatch[0].replace(/id="\d+"/, `id="${charPrId}"`);
+
+            if (update.style.fontSize) {
+              const heightVal = Math.round(update.style.fontSize * 100);
+              clonedCharPr = clonedCharPr.replace(/height="\d+"/, `height="${heightVal}"`);
+            }
+            if (update.style.fontColor) {
+              clonedCharPr = clonedCharPr.replace(/textColor="[^"]*"/, `textColor="#${update.style.fontColor}"`);
+            }
+            if (update.style.backgroundColor) {
+              clonedCharPr = clonedCharPr.replace(/shadeColor="[^"]*"/, `shadeColor="#${update.style.backgroundColor}"`);
+            }
+            if (update.style.bold) {
+              if (!clonedCharPr.includes('<hh:bold')) clonedCharPr = clonedCharPr.replace('</hh:charPr>', '<hh:bold/></hh:charPr>');
+            } else if (update.style.bold === false) {
+              clonedCharPr = clonedCharPr.replace(/<hh:bold[^/]*\/>/g, '');
+            }
+            if (update.style.italic) {
+              if (!clonedCharPr.includes('<hh:italic')) clonedCharPr = clonedCharPr.replace('</hh:charPr>', '<hh:italic/></hh:charPr>');
+            } else if (update.style.italic === false) {
+              clonedCharPr = clonedCharPr.replace(/<hh:italic[^/]*\/>/g, '');
+            }
+            if (update.style.underline) {
+              if (!clonedCharPr.includes('<hh:underline')) clonedCharPr = clonedCharPr.replace('</hh:charPr>', '<hh:underline/></hh:charPr>');
+            } else if (update.style.underline === false) {
+              clonedCharPr = clonedCharPr.replace(/<hh:underline[^/]*\/>/g, '');
+            }
+            if (update.style.strikethrough) {
+              if (!clonedCharPr.includes('<hh:strikeout')) clonedCharPr = clonedCharPr.replace('</hh:charPr>', '<hh:strikeout/></hh:charPr>');
+            } else if (update.style.strikethrough === false) {
+              clonedCharPr = clonedCharPr.replace(/<hh:strikeout[^/]*\/>/g, '');
+            }
+            // Font name: update fontRef IDs
+            if (update.style.fontName) {
+              const fontName = update.style.fontName;
+              for (const [lang, attr] of Object.entries(langToAttr)) {
+                const fontMap = langToFontMap.get(lang);
+                const fontId = fontMap?.get(fontName) ?? 0;
+                clonedCharPr = clonedCharPr.replace(
+                  new RegExp(`${attr}="\\d+"`),
+                  `${attr}="${fontId}"`
+                );
+              }
+            }
+
+            newCharPrs.push(clonedCharPr);
+          } else {
+            // Fallback: build from template (original behavior for charPr id=0 or missing)
+            const fontSize = update.style.fontSize ? Math.round(update.style.fontSize * 100) : 1000;
+            const fontName = update.style.fontName || '함초롬바탕';
+            const fontRefParts: string[] = [];
+            for (const [lang, attr] of Object.entries(langToAttr)) {
+              const fontMap = langToFontMap.get(lang);
+              const fontId = fontMap?.get(fontName) ?? 0;
+              fontRefParts.push(`${attr}="${fontId}"`);
+            }
+            const fontRefStr = `<hh:fontRef ${fontRefParts.join(' ')}/>`;
+            const styleTags: string[] = [];
+            if (update.style.bold) styleTags.push('<hh:bold/>');
+            if (update.style.italic) styleTags.push('<hh:italic/>');
+            if (update.style.underline) styleTags.push('<hh:underline/>');
+            if (update.style.strikethrough) styleTags.push('<hh:strikeout/>');
+            const styleTagsStr = styleTags.length > 0 ? '\n        ' + styleTags.join('\n        ') : '';
+            const textColorAttr = update.style.fontColor ? `#${update.style.fontColor}` : '#000000';
+            const shadeColorAttr = update.style.backgroundColor ? `#${update.style.backgroundColor}` : 'none';
+
+            const charPr = `      <hh:charPr id="${charPrId}" height="${fontSize}" textColor="${textColorAttr}" shadeColor="${shadeColorAttr}" useFontSpace="0" useKerning="0" symMark="NONE" borderFillIDRef="1">
+        ${fontRefStr}
+        ${baseInnerXml}${styleTagsStr}
+      </hh:charPr>`;
+            newCharPrs.push(charPr);
+          }
+        }
+
+        // Update run's charPrIDRef in paragraph XML
+        const runRegex2 = /<hp:run\s+charPrIDRef="(\d+)"/g;
+        let runCount2 = 0;
+        let runMatch2;
+        while ((runMatch2 = runRegex2.exec(paraXml)) !== null) {
+          if (runCount2 === update.runIndex) {
+            const oldAttr = runMatch2[0];
+            const newAttr = `<hp:run charPrIDRef="${charPrId}"`;
+            paraXml = paraXml.slice(0, runMatch2.index) + newAttr + paraXml.slice(runMatch2.index + oldAttr.length);
+            break;
+          }
+          runCount2++;
+        }
+
+        sectionXml = sectionXml.slice(0, targetParagraphStart) + paraXml + sectionXml.slice(targetParagraphEnd);
       }
 
       // Save updated section XML

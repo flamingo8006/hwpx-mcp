@@ -206,6 +206,15 @@ export interface PendingHeaderFooterUpdate {
   text: string;
 }
 
+export interface PendingNumberingUpdate {
+  sectionIndex: number;
+  elementIndex: number;
+  paragraphId: string;
+  headingType: 'number' | 'bullet';
+  numberingId: number;  // reference to numbering or bullet def in header.xml
+  level: number;
+}
+
 export interface PendingCellStyleUpdate {
   sectionIndex: number;
   tableIndex: number;
