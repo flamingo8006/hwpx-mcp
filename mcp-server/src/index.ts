@@ -1296,6 +1296,40 @@ batch_fill_table({
     },
   },
   {
+    name: 'set_cell_background_color',
+    description: 'Set background color for a table cell (HWPX only). Creates borderFill definition and updates cell reference.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        doc_id: { type: 'string', description: 'Document ID' },
+        section_index: { type: 'number', description: 'Section index' },
+        table_index: { type: 'number', description: 'Table index' },
+        row: { type: 'number', description: 'Row index (0-based)' },
+        col: { type: 'number', description: 'Column index (0-based)' },
+        background_color: { type: 'string', description: 'Background color in hex (e.g. "FFFF00" for yellow, "E0E0E0" for light gray)' },
+      },
+      required: ['doc_id', 'section_index', 'table_index', 'row', 'col', 'background_color'],
+    },
+  },
+  {
+    name: 'set_column_widths',
+    description: 'Set individual column widths for an existing table (HWPX only). Updates cellSz, colSz, and table width in XML.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        doc_id: { type: 'string', description: 'Document ID' },
+        section_index: { type: 'number', description: 'Section index' },
+        table_index: { type: 'number', description: 'Table index' },
+        col_widths: {
+          type: 'array',
+          items: { type: 'number' },
+          description: 'Column widths in hwpunit. Array length must equal the number of columns.'
+        },
+      },
+      required: ['doc_id', 'section_index', 'table_index', 'col_widths'],
+    },
+  },
+  {
     name: 'insert_page_break',
     description: 'Insert a page break after the specified element (HWPX only). Creates an empty paragraph with pageBreak attribute.',
     inputSchema: {
@@ -3654,6 +3688,36 @@ Call get_tool_guide with: template, table, image, search, read, create`
         );
         if (!result) return error('Failed to insert table');
         return success({ message: 'Table inserted', tableIndex: result.tableIndex });
+      }
+
+      case 'set_cell_background_color': {
+        const doc = getDoc(args?.doc_id as string);
+        if (!doc) return error('Document not found');
+        if (doc.format === 'hwp') return error('HWP files are read-only');
+
+        const result = doc.setCellBackgroundColor(
+          args?.section_index as number,
+          args?.table_index as number,
+          args?.row as number,
+          args?.col as number,
+          args?.background_color as string
+        );
+        if (!result) return error('Failed to set cell background color');
+        return success({ message: 'Cell background color set' });
+      }
+
+      case 'set_column_widths': {
+        const doc = getDoc(args?.doc_id as string);
+        if (!doc) return error('Document not found');
+        if (doc.format === 'hwp') return error('HWP files are read-only');
+
+        const result = doc.setColumnWidths(
+          args?.section_index as number,
+          args?.table_index as number,
+          args?.col_widths as number[]
+        );
+        if (!result) return error('Failed to set column widths (invalid table or wrong number of columns)');
+        return success({ message: 'Column widths updated' });
       }
 
       case 'insert_page_break': {

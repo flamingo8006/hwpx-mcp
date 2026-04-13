@@ -206,6 +206,22 @@ export interface PendingHeaderFooterUpdate {
   text: string;
 }
 
+export interface PendingCellStyleUpdate {
+  sectionIndex: number;
+  tableIndex: number;
+  tableId: string;
+  row: number;
+  col: number;
+  backgroundColor?: string; // hex color e.g. "FFFF00"
+}
+
+export interface PendingColumnWidthUpdate {
+  sectionIndex: number;
+  tableIndex: number;
+  tableId: string;
+  colWidths: number[]; // hwpunit
+}
+
 export interface PendingTableMove {
   type: 'move' | 'copy';
   sourceSectionIndex: number;

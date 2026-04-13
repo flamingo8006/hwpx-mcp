@@ -19,7 +19,7 @@ import type {
   PendingRunSplit, PendingTableRowInsert, PendingTableRowDelete,
   PendingTableColumnInsert, PendingTableColumnDelete,
   PendingParagraphCopy, PendingParagraphMove, PendingHeaderFooterUpdate,
-  PendingTableMove,
+  PendingTableMove, PendingColumnWidthUpdate, PendingCellStyleUpdate,
 } from './types/operations';
 import {
   HwpxContent,
@@ -144,6 +144,8 @@ export class HwpxDocument {
   private _pendingParagraphMoves: PendingParagraphMove[] = [];
   private _pendingHeaderUpdates: PendingHeaderFooterUpdate[] = [];
   private _pendingFooterUpdates: PendingHeaderFooterUpdate[] = [];
+  private _pendingColumnWidthUpdates: PendingColumnWidthUpdate[] = [];
+  private _pendingCellStyleUpdates: PendingCellStyleUpdate[] = [];
 
   // Cache for character properties (id → font size in pt)
   private _charPrCache: Map<number, number> | null = null;
@@ -437,6 +439,8 @@ export class HwpxDocument {
     this._pendingParagraphStyles = [];
     this._pendingCharacterStyles = [];
     this._pendingRunSplits = [];
+    this._pendingColumnWidthUpdates = [];
+    this._pendingCellStyleUpdates = [];
     this._pendingTableRowInserts = [];
     this._pendingTableRowDeletes = [];
     this._pendingTableColumnInserts = [];
@@ -2723,6 +2727,67 @@ export class HwpxDocument {
     return true;
   }
 
+  /**
+   * Set background color for a table cell.
+   * Creates a new borderFill in header.xml and updates the cell's borderFillIDRef.
+   * @param backgroundColor Hex color string (e.g. "FFFF00" for yellow)
+   */
+  setCellBackgroundColor(sectionIndex: number, tableIndex: number, row: number, col: number, backgroundColor: string): boolean {
+    const table = this.findTable(sectionIndex, tableIndex);
+    if (!table) return false;
+    const cell = table.rows[row]?.cells[col];
+    if (!cell) return false;
+
+    this.saveState();
+
+    this._pendingCellStyleUpdates.push({
+      sectionIndex,
+      tableIndex,
+      tableId: table.id,
+      row,
+      col,
+      backgroundColor,
+    });
+
+    this.markModified();
+    return true;
+  }
+
+  /**
+   * Set individual column widths for an existing table.
+   * @param colWidths Array of column widths in hwpunit (length must equal column count)
+   */
+  setColumnWidths(sectionIndex: number, tableIndex: number, colWidths: number[]): boolean {
+    const table = this.findTable(sectionIndex, tableIndex);
+    if (!table) return false;
+
+    const colCount = table.rows[0]?.cells.length || 0;
+    if (colWidths.length !== colCount) return false;
+
+    this.saveState();
+
+    // Update in-memory: cell widths + table width + columnWidths
+    const totalWidth = colWidths.reduce((sum, w) => sum + w, 0);
+    for (const row of table.rows) {
+      for (let c = 0; c < row.cells.length && c < colWidths.length; c++) {
+        row.cells[c].width = colWidths[c];
+      }
+    }
+    table.width = totalWidth / 100; // points (parser convention)
+    table.columnWidths = colWidths.map(w => w / 100);
+
+    // Register for XML sync
+    this._pendingColumnWidthUpdates.push({
+      sectionIndex,
+      tableIndex,
+      tableId: table.id,
+      colWidths,
+    });
+
+    this.markModified();
+    return true;
+  }
+
   insertTableRow(sectionIndex: number, tableIndex: number, afterRowIndex: number, cellTexts?: string[]): boolean {
     const table = this.findTable(sectionIndex, tableIndex);
     if (!table || !table.rows[afterRowIndex]) return false;
@@ -4735,6 +4800,18 @@ export class HwpxDocument {
       this._pendingParagraphInserts = [];
     }
 
+    // Apply cell style updates (background color via borderFill)
+    if (this._pendingCellStyleUpdates && this._pendingCellStyleUpdates.length > 0) {
+      await this.applyCellStyleUpdatesToXml();
+      this._pendingCellStyleUpdates = [];
+    }
+
+    // Apply column width updates
+    if (this._pendingColumnWidthUpdates && this._pendingColumnWidthUpdates.length > 0) {
+      await this.applyColumnWidthUpdatesToXml();
+      this._pendingColumnWidthUpdates = [];
+    }
+
     // Apply table cell updates (preserves original XML structure)
     if (this._pendingTableCellUpdates && this._pendingTableCellUpdates.length > 0) {
       await this.applyTableCellUpdatesToXml();
@@ -6306,6 +6383,203 @@ export class HwpxDocument {
    * - Validates XML structure after changes
    * - Reverts to original if validation fails
    */
+  /**
+   * Apply cell style updates (background color) to XML.
+   * Creates new borderFill definitions in header.xml and updates cell borderFillIDRef.
+   */
+  private async applyCellStyleUpdatesToXml(): Promise<void> {
+    if (!this._zip || this._pendingCellStyleUpdates.length === 0) return;
+
+    // Read header.xml
+    const headerPath = 'Contents/header.xml';
+    let headerXml = await this._zip.file(headerPath)?.async('string');
+    if (!headerXml) return;
+
+    // Find max borderFill id
+    let maxBorderFillId = 0;
+    const bfIdRegex = /<hh:borderFill\s+[^>]*id="(\d+)"/g;
+    let bfMatch: RegExpExecArray | null;
+    while ((bfMatch = bfIdRegex.exec(headerXml)) !== null) {
+      maxBorderFillId = Math.max(maxBorderFillId, parseInt(bfMatch[1], 10));
+    }
+
+    // Map from backgroundColor → new borderFill id (dedup)
+    const colorToId = new Map<string, number>();
+    const newBorderFills: string[] = [];
+
+    // Group updates by section
+    const updatesBySection = new Map<number, PendingCellStyleUpdate[]>();
+    for (const update of this._pendingCellStyleUpdates) {
+      const list = updatesBySection.get(update.sectionIndex) || [];
+      list.push(update);
+      updatesBySection.set(update.sectionIndex, list);
+
+      // Create borderFill for each unique color
+      if (update.backgroundColor && !colorToId.has(update.backgroundColor)) {
+        maxBorderFillId++;
+        colorToId.set(update.backgroundColor, maxBorderFillId);
+        newBorderFills.push(`      <hh:borderFill id="${maxBorderFillId}" threeD="0" shadow="0" centerLine="NONE" breakCellSeparateLine="0">
+        <hh:leftBorder type="SOLID" width="0.12mm" color="#000000"/>
+        <hh:rightBorder type="SOLID" width="0.12mm" color="#000000"/>
+        <hh:topBorder type="SOLID" width="0.12mm" color="#000000"/>
+        <hh:bottomBorder type="SOLID" width="0.12mm" color="#000000"/>
+        <hh:fillBrush><hh:winBrush faceColor="#${update.backgroundColor}" hatchColor="#000000" alpha="0"/></hh:fillBrush>
+      </hh:borderFill>`);
+      }
+    }
+
+    // Insert borderFills into header.xml
+    if (newBorderFills.length > 0) {
+      const insertPos = headerXml.lastIndexOf('</hh:borderFillProperties>');
+      if (insertPos >= 0) {
+        headerXml = headerXml.slice(0, insertPos) +
+          '\n' + newBorderFills.join('\n') + '\n' +
+          headerXml.slice(insertPos);
+
+        // Update itemCnt
+        headerXml = headerXml.replace(
+          /<hh:borderFillProperties\s+itemCnt="(\d+)"/,
+          (_m: string, cnt: string) => `<hh:borderFillProperties itemCnt="${parseInt(cnt, 10) + newBorderFills.length}"`
+        );
+      }
+      this._zip.file(headerPath, headerXml);
+    }
+
+    // Update cell borderFillIDRef in section XML
+    for (const [sectionIndex, updates] of updatesBySection) {
+      const sectionPath = `Contents/section${sectionIndex}.xml`;
+      const file = this._zip.file(sectionPath);
+      if (!file) continue;
+
+      let xml = await file.async('string');
+
+      for (const update of updates) {
+        if (!update.backgroundColor) continue;
+        const newId = colorToId.get(update.backgroundColor);
+        if (!newId) continue;
+
+        const tableMatch = this.findTableById(xml, update.tableId);
+        if (!tableMatch) continue;
+
+        let tableXml = tableMatch.xml;
+        const rows = this.findAllElementsWithDepth(tableXml, 'tr');
+        if (update.row >= rows.length) continue;
+
+        const rowXml = rows[update.row].xml;
+        const cells = this.findAllElementsWithDepth(rowXml, 'tc');
+        if (update.col >= cells.length) continue;
+
+        // Update borderFillIDRef in the cell
+        const cellXml = cells[update.col].xml;
+        const updatedCellXml = cellXml.replace(
+          /borderFillIDRef="\d+"/,
+          `borderFillIDRef="${newId}"`
+        );
+
+        const updatedRowXml = rowXml.substring(0, cells[update.col].startIndex) +
+          updatedCellXml +
+          rowXml.substring(cells[update.col].endIndex);
+
+        tableXml = tableXml.substring(0, rows[update.row].startIndex) +
+          updatedRowXml +
+          tableXml.substring(rows[update.row].endIndex);
+
+        xml = xml.substring(0, tableMatch.startIndex) +
+          tableXml +
+          xml.substring(tableMatch.endIndex);
+      }
+
+      this._zip.file(sectionPath, xml);
+    }
+  }
+
+  /**
+   * Apply column width updates to XML.
+   * Updates <hp:cellSz width="...">, <hp:sz width="...">, and <hp:colSz> in the table XML.
+   */
+  private async applyColumnWidthUpdatesToXml(): Promise<void> {
+    if (!this._zip) return;
+
+    const updatesBySection = new Map<number, PendingColumnWidthUpdate[]>();
+    for (const update of this._pendingColumnWidthUpdates) {
+      const list = updatesBySection.get(update.sectionIndex) || [];
+      list.push(update);
+      updatesBySection.set(update.sectionIndex, list);
+    }
+
+    for (const [sectionIndex, updates] of updatesBySection) {
+      const sectionPath = `Contents/section${sectionIndex}.xml`;
+      const file = this._zip.file(sectionPath);
+      if (!file) continue;
+
+      let xml = await file.async('string');
+
+      for (const update of updates) {
+        const tableMatch = this.findTableById(xml, update.tableId);
+        if (!tableMatch) continue;
+
+        let tableXml = tableMatch.xml;
+        const totalWidth = update.colWidths.reduce((sum, w) => sum + w, 0);
+
+        // Update <hp:sz width="...">
+        tableXml = tableXml.replace(
+          /(<hp:sz\s[^>]*width=")(\d+)(")/,
+          `$1${totalWidth}$3`
+        );
+
+        // Update <hp:cellSz width="..."> for each cell (row by row, col by col)
+        const rows = this.findAllElementsWithDepth(tableXml, 'tr');
+        let updatedTableXml = tableXml;
+
+        // Process rows in reverse to avoid offset shifting
+        for (let r = rows.length - 1; r >= 0; r--) {
+          const rowXml = rows[r].xml;
+          const cells = this.findAllElementsWithDepth(rowXml, 'tc');
+          let updatedRowXml = rowXml;
+
+          // Process cells in reverse
+          for (let c = cells.length - 1; c >= 0; c--) {
+            if (c < update.colWidths.length) {
+              const cellXml = cells[c].xml;
+              const updatedCellXml = cellXml.replace(
+                /(<hp:cellSz\s[^>]*width=")(\d+)(")/,
+                `$1${update.colWidths[c]}$3`
+              );
+              updatedRowXml = updatedRowXml.substring(0, cells[c].startIndex) +
+                updatedCellXml +
+                updatedRowXml.substring(cells[c].endIndex);
+            }
+          }
+
+          updatedTableXml = updatedTableXml.substring(0, rows[r].startIndex) +
+            updatedRowXml +
+            updatedTableXml.substring(rows[r].endIndex);
+        }
+
+        // Update or insert <hp:colSz>
+        const colSzContent = update.colWidths.join(' ');
+        if (updatedTableXml.includes('<hp:colSz>')) {
+          updatedTableXml = updatedTableXml.replace(
+            /<hp:colSz>[^<]*<\/hp:colSz>/,
+            `<hp:colSz>${colSzContent}</hp:colSz>`
+          );
+        } else {
+          // Insert before </hp:tbl>
+          updatedTableXml = updatedTableXml.replace(
+            '</hp:tbl>',
+            `<hp:colSz>${colSzContent}</hp:colSz></hp:tbl>`
+          );
+        }
+
+        xml = xml.substring(0, tableMatch.startIndex) +
+          updatedTableXml +
+          xml.substring(tableMatch.endIndex);
+      }
+
+      this._zip.file(sectionPath, xml);
+    }
+  }
+
   private async applyTableCellUpdatesToXml(): Promise<void> {
     if (!this._zip) return;
 
