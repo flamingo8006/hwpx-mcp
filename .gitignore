@@ -11,3 +11,9 @@ test-format-text*.hwpx
 test-col-widths*.hwpx
 mcp-server/dist/
 mcp-server/node_modules/
+mcp-server/debug-*.txt
+mcp-server/debug-*.md
+mcp-server/debug-*.log
+mcp-server/*.mjs
+mcp-server/test-*.hwpx
+.claude/
