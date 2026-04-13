@@ -6612,9 +6612,14 @@ export class HwpxDocument {
       }
     }
 
-    // Insert borderFills into header.xml
+    // Insert borderFills into header.xml (supports both borderFillProperties and borderFills tags)
     if (newBorderFills.length > 0) {
-      const insertPos = headerXml.lastIndexOf('</hh:borderFillProperties>');
+      let insertPos = headerXml.lastIndexOf('</hh:borderFillProperties>');
+      let tagName = 'borderFillProperties';
+      if (insertPos < 0) {
+        insertPos = headerXml.lastIndexOf('</hh:borderFills>');
+        tagName = 'borderFills';
+      }
       if (insertPos >= 0) {
         headerXml = headerXml.slice(0, insertPos) +
           '\n' + newBorderFills.join('\n') + '\n' +
@@ -6622,8 +6627,8 @@ export class HwpxDocument {
 
         // Update itemCnt
         headerXml = headerXml.replace(
-          /<hh:borderFillProperties\s+itemCnt="(\d+)"/,
-          (_m: string, cnt: string) => `<hh:borderFillProperties itemCnt="${parseInt(cnt, 10) + newBorderFills.length}"`
+          new RegExp(`<hh:${tagName}\\s+itemCnt="(\\d+)"`),
+          (_m: string, cnt: string) => `<hh:${tagName} itemCnt="${parseInt(cnt, 10) + newBorderFills.length}"`
         );
       }
       this._zip.file(headerPath, headerXml);
