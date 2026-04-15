@@ -5871,9 +5871,22 @@ export class HwpxDocument {
         while ((m = shapeIdRegex.exec(headerXml)) !== null) {
           maxCharPrId = Math.max(maxCharPrId, parseInt(m[1], 10));
         }
-        // Get base charPr id=0 as template
+        // Get base charPr/charShape id=0 as template (supports both formats)
         const baseMatch = headerXml.match(/<hh:charPr\s+[^>]*id="0"[^>]*>[\s\S]*?<\/hh:charPr>/);
-        if (baseMatch) baseCharPrXml = baseMatch[0];
+        if (baseMatch) {
+          baseCharPrXml = baseMatch[0];
+        } else {
+          // Fallback: charShapeList format — clone charShape and normalize to charPr
+          // Handles both <hh:charShape ...>...</hh:charShape> and self-closing <hh:charShape .../>
+          const baseShapeMatch = headerXml.match(/<hh:charShape\s+[^>]*id="0"[^>]*>[\s\S]*?<\/hh:charShape>/)
+            || headerXml.match(/<hh:charShape\s+[^>]*id="0"[^/]*\/>/);
+          if (baseShapeMatch) {
+            baseCharPrXml = baseShapeMatch[0]
+              .replace(/<hh:charShape\b/g, '<hh:charPr')
+              .replace(/<\/hh:charShape>/g, '</hh:charPr>')
+              .replace(/\/>$/, '></hh:charPr>'); // convert self-closing to open+close
+          }
+        }
       }
     }
 
@@ -6052,18 +6065,33 @@ export class HwpxDocument {
       this._zip.file(sectionPath, xml);
     }
 
-    // Write new charPr entries into <hh:charProperties> in header.xml
+    // Write new charPr entries into header.xml (supports both charProperties and charShapeList)
     if (newCharPrs.length > 0 && headerXml) {
-      // Update itemCnt FIRST (before inserting content changes string offsets)
-      headerXml = headerXml.replace(
-        /<hh:charProperties\s+itemCnt="(\d+)"/,
-        (_match: string, cnt: string) => `<hh:charProperties itemCnt="${parseInt(cnt, 10) + newCharPrs.length}"`
-      );
-      // Then insert new charPr entries before </hh:charProperties>
-      headerXml = headerXml.replace(
-        '</hh:charProperties>',
-        newCharPrs.join('\n') + '\n</hh:charProperties>'
-      );
+      const hasCharProperties = headerXml.includes('</hh:charProperties>');
+      if (hasCharProperties) {
+        // charProperties format: insert as charPr
+        headerXml = headerXml.replace(
+          /<hh:charProperties\s+itemCnt="(\d+)"/,
+          (_m: string, cnt: string) => `<hh:charProperties itemCnt="${parseInt(cnt, 10) + newCharPrs.length}"`
+        );
+        headerXml = headerXml.replace(
+          '</hh:charProperties>',
+          newCharPrs.join('\n') + '\n</hh:charProperties>'
+        );
+      } else {
+        // charShapeList format: convert charPr → charShape and insert
+        const asCharShapes = newCharPrs.map(cp =>
+          cp.replace(/<hh:charPr\b/g, '<hh:charShape').replace(/<\/hh:charPr>/g, '</hh:charShape>')
+        );
+        headerXml = headerXml.replace(
+          /<hh:charShapeList\s+itemCnt="(\d+)"/,
+          (_m: string, cnt: string) => `<hh:charShapeList itemCnt="${parseInt(cnt, 10) + asCharShapes.length}"`
+        );
+        headerXml = headerXml.replace(
+          '</hh:charShapeList>',
+          asCharShapes.join('\n') + '\n</hh:charShapeList>'
+        );
+      }
       this._zip.file('Contents/header.xml', headerXml);
     }
   }
