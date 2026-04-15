@@ -15,7 +15,7 @@ import type {
   PendingTableInsert, PendingImageDelete, PendingTableDelete,
   PendingParagraphDelete, PendingCellMerge, PendingCellSplit,
   PendingHangingIndent, PendingTableCellHangingIndent,
-  PendingParagraphInsert, PendingParagraphStyle, PendingCharacterStyle,
+  PendingParagraphInsert, PendingParagraphStyle, PendingCharacterStyle, PendingTableCellCharacterStyle,
   PendingRunSplit, PendingTableRowInsert, PendingTableRowDelete,
   PendingTableColumnInsert, PendingTableColumnDelete,
   PendingParagraphCopy, PendingParagraphMove, PendingHeaderFooterUpdate,
@@ -136,6 +136,7 @@ export class HwpxDocument {
   private _pendingParagraphInserts: PendingParagraphInsert[] = [];
   private _pendingParagraphStyles: PendingParagraphStyle[] = [];
   private _pendingCharacterStyles: PendingCharacterStyle[] = [];
+  private _pendingTableCellCharacterStyles: PendingTableCellCharacterStyle[] = [];
   private _pendingRunSplits: PendingRunSplit[] = [];
   private _pendingTableRowInserts: PendingTableRowInsert[] = [];
   private _pendingTableRowDeletes: PendingTableRowDelete[] = [];
@@ -505,6 +506,19 @@ export class HwpxDocument {
     };
   }
 
+  getElementCount(sectionIndex: number): number {
+    return this._content.sections[sectionIndex]?.elements?.length ?? 0;
+  }
+
+  /**
+   * Flush all pending inserts and style changes to XML immediately.
+   * Used by build_document to keep XML in sync between each element insertion,
+   * preventing element index mismatch when paragraphs and tables are interleaved.
+   */
+  async flushPendingToXml(): Promise<void> {
+    await this.syncContentToZip();
+  }
+
   // ============================================================
   // Paragraph Operations
   // ============================================================
@@ -696,7 +710,7 @@ export class HwpxDocument {
     return true;
   }
 
-  insertParagraph(sectionIndex: number, afterElementIndex: number, text: string = ''): number {
+  insertParagraph(sectionIndex: number, afterElementIndex: number, text: string = '', charStyle?: { bold?: boolean; italic?: boolean; underline?: boolean; fontSize?: number; fontColor?: string }): number {
     const section = this._content.sections[sectionIndex];
     if (!section) return -1;
 
@@ -716,6 +730,11 @@ export class HwpxDocument {
       afterElementIndex,
       paragraphId,
       text,
+      bold: charStyle?.bold,
+      italic: charStyle?.italic,
+      underline: charStyle?.underline,
+      fontSize: charStyle?.fontSize,
+      fontColor: charStyle?.fontColor,
     });
 
     this.markModified();
@@ -843,6 +862,34 @@ export class HwpxDocument {
     this._pendingCharacterStyles.push({
       sectionIndex,
       elementIndex,
+      runIndex,
+      style,
+    });
+
+    this.markModified();
+  }
+
+  /**
+   * Apply character style to a paragraph run inside a table cell.
+   */
+  applyTableCellCharacterStyle(sectionIndex: number, tableIndex: number, row: number, col: number, paragraphIndex: number, runIndex: number, style: Partial<CharacterStyle>): void {
+    const table = this.findTable(sectionIndex, tableIndex);
+    if (!table) return;
+    const cell = table.rows[row]?.cells[col];
+    if (!cell) return;
+    const paragraph = cell.paragraphs[paragraphIndex];
+    if (!paragraph || !paragraph.runs[runIndex]) return;
+
+    this.saveState();
+    const run = paragraph.runs[runIndex];
+    run.charStyle = { ...run.charStyle, ...style };
+
+    this._pendingTableCellCharacterStyles.push({
+      sectionIndex,
+      tableIndex,
+      row,
+      col,
+      paragraphIndex,
       runIndex,
       style,
     });
@@ -2808,6 +2855,107 @@ export class HwpxDocument {
     });
 
     this.markModified();
+    return true;
+  }
+
+  /**
+   * Set paragraph alignment for table cells directly in XML.
+   * Must be called AFTER flushPendingToXml() so the table exists in the ZIP.
+   * Creates a new paraPr with the specified alignment and updates cell paragraphs.
+   */
+  async setTableCellAlignmentInXml(sectionIndex: number, tableIndex: number, rows: number[], cols: number, align: string): Promise<boolean> {
+    if (!this._zip) return false;
+
+    // Read header.xml and create center-aligned paraPr
+    const headerPath = 'Contents/header.xml';
+    let headerXml = await this._zip.file(headerPath)?.async('string');
+    if (!headerXml) return false;
+
+    // Find max paraPr id
+    let maxParaPrId = 0;
+    const paraPrIdRegex = /<hh:paraPr\s+[^>]*id="(\d+)"/g;
+    let m;
+    while ((m = paraPrIdRegex.exec(headerXml)) !== null) {
+      maxParaPrId = Math.max(maxParaPrId, parseInt(m[1], 10));
+    }
+
+    // Clone paraPr id=0 and change alignment
+    const baseMatch = headerXml.match(/<hh:paraPr\s+[^>]*id="0"[^>]*>[\s\S]*?<\/hh:paraPr>/);
+    if (!baseMatch) return false;
+
+    const newId = maxParaPrId + 1;
+    let newParaPr = baseMatch[0].replace(/id="\d+"/, `id="${newId}"`);
+    // Replace horizontal alignment
+    const alignMap: Record<string, string> = { left: 'LEFT', center: 'CENTER', right: 'RIGHT', justify: 'JUSTIFY' };
+    const hwpAlign = alignMap[align] || 'CENTER';
+    newParaPr = newParaPr.replace(/horizontal="[^"]*"/, `horizontal="${hwpAlign}"`);
+
+    // Insert into paraProperties
+    headerXml = headerXml.replace(
+      /<hh:paraProperties\s+itemCnt="(\d+)"/,
+      (_m: string, cnt: string) => `<hh:paraProperties itemCnt="${parseInt(cnt, 10) + 1}"`
+    );
+    headerXml = headerXml.replace(
+      '</hh:paraProperties>',
+      newParaPr + '\n</hh:paraProperties>'
+    );
+    this._zip.file(headerPath, headerXml);
+
+    // Update cell paragraphs in section XML
+    const sectionPath = `Contents/section${sectionIndex}.xml`;
+    let sectionXml = await this._zip.file(sectionPath)?.async('string');
+    if (!sectionXml) return false;
+
+    // Find the target table
+    const tables = this.findTopLevelElements(sectionXml).filter(e => e.type === 'tbl');
+    if (tableIndex >= tables.length) return false;
+
+    const tblElem = tables[tableIndex];
+    const tblStart = tblElem.start;
+    // Find table end
+    const tblEndTag = '</hp:tbl>';
+    let tblEnd = sectionXml.indexOf(tblEndTag, tblStart);
+    if (tblEnd === -1) return false;
+    tblEnd += tblEndTag.length;
+
+    let tableXml = sectionXml.slice(tblStart, tblEnd);
+
+    // Find rows and update paraPrIDRef in specified cells
+    for (const rowIdx of rows) {
+      // Find the rowIdx-th <hp:tr> (skip nested ones inside subList)
+      let trSearchPos = 0;
+      let trCount = -1;
+      while (trSearchPos < tableXml.length) {
+        const trPos = tableXml.indexOf('<hp:tr', trSearchPos);
+        if (trPos === -1) break;
+        // Check not nested
+        const before = tableXml.substring(Math.max(0, trPos - 200), trPos);
+        const subOpen = before.lastIndexOf('<hp:subList');
+        const subClose = before.lastIndexOf('</hp:subList>');
+        if (subOpen <= subClose) {
+          trCount++;
+          if (trCount === rowIdx) {
+            // Found the right row, now update paraPrIDRef in each cell's paragraph
+            const trEnd = tableXml.indexOf('</hp:tr>', trPos);
+            if (trEnd === -1) break;
+            let rowXml = tableXml.slice(trPos, trEnd + '</hp:tr>'.length);
+
+            // Replace paraPrIDRef in top-level <hp:p> inside <hp:tc>
+            // Only replace paragraphs inside subList (which are cell paragraphs)
+            rowXml = rowXml.replace(/<hp:p\s+([^>]*)paraPrIDRef="\d+"/g, (match, before) => {
+              return `<hp:p ${before}paraPrIDRef="${newId}"`;
+            });
+
+            tableXml = tableXml.slice(0, trPos) + rowXml + tableXml.slice(trEnd + '</hp:tr>'.length);
+            break;
+          }
+        }
+        trSearchPos = trPos + 1;
+      }
+    }
+
+    sectionXml = sectionXml.slice(0, tblStart) + tableXml + sectionXml.slice(tblEnd);
+    this._zip.file(sectionPath, sectionXml);
     return true;
   }
 
@@ -4960,6 +5108,12 @@ export class HwpxDocument {
       this._pendingCharacterStyles = [];
     }
 
+    // Apply table cell character style changes
+    if (this._pendingTableCellCharacterStyles && this._pendingTableCellCharacterStyles.length > 0) {
+      await this.applyTableCellCharacterStylesToXml();
+      this._pendingTableCellCharacterStyles = [];
+    }
+
     // Apply table row inserts
     if (this._pendingTableRowInserts && this._pendingTableRowInserts.length > 0) {
       await this.applyTableRowInsertsToXml();
@@ -5692,12 +5846,50 @@ export class HwpxDocument {
   private async applyParagraphInsertsToXml(): Promise<void> {
     if (!this._zip) return;
 
+    // Check if any insert has inline char style
+    const hasInlineCharStyle = this._pendingParagraphInserts.some(
+      ins => ins.bold !== undefined || ins.italic !== undefined || ins.underline !== undefined || ins.fontSize !== undefined || ins.fontColor !== undefined
+    );
+
+    // If inline char styles exist, prepare header.xml for new charPr entries
+    let headerXml: string | undefined;
+    let maxCharPrId = 0;
+    let baseCharPrXml = '';
+    const charPrCache = new Map<string, number>(); // dedup key → charPr id
+
+    if (hasInlineCharStyle) {
+      const headerPath = 'Contents/header.xml';
+      headerXml = await this._zip.file(headerPath)?.async('string');
+      if (headerXml) {
+        // Find max charPr id
+        const idRegex = /<hh:charPr\s+[^>]*id="(\d+)"/g;
+        let m;
+        while ((m = idRegex.exec(headerXml)) !== null) {
+          maxCharPrId = Math.max(maxCharPrId, parseInt(m[1], 10));
+        }
+        const shapeIdRegex = /<hh:charShape\s+[^>]*id="(\d+)"/g;
+        while ((m = shapeIdRegex.exec(headerXml)) !== null) {
+          maxCharPrId = Math.max(maxCharPrId, parseInt(m[1], 10));
+        }
+        // Get base charPr id=0 as template
+        const baseMatch = headerXml.match(/<hh:charPr\s+[^>]*id="0"[^>]*>[\s\S]*?<\/hh:charPr>/);
+        if (baseMatch) baseCharPrXml = baseMatch[0];
+      }
+    }
+
+    const newCharPrs: string[] = [];
+
     // Group inserts by section
     const insertsBySection = new Map<number, Array<{
       afterElementIndex: number;
       paragraphId: string;
       text: string;
       pageBreak?: boolean;
+      bold?: boolean;
+      italic?: boolean;
+      underline?: boolean;
+      fontSize?: number;
+      fontColor?: string;
     }>>();
 
     for (const insert of this._pendingParagraphInserts) {
@@ -5707,6 +5899,11 @@ export class HwpxDocument {
         paragraphId: insert.paragraphId,
         text: insert.text,
         pageBreak: insert.pageBreak,
+        bold: insert.bold,
+        italic: insert.italic,
+        underline: insert.underline,
+        fontSize: insert.fontSize,
+        fontColor: insert.fontColor,
       });
       insertsBySection.set(insert.sectionIndex, sectionInserts);
     }
@@ -5727,9 +5924,50 @@ export class HwpxDocument {
         // Escape text for XML
         const escapedText = this.escapeXml(insert.text);
 
+        // Determine charPrIDRef: create new charPr if inline style provided
+        let charPrIDRef = '0';
+        const hasStyle = insert.bold !== undefined || insert.italic !== undefined ||
+                         insert.underline !== undefined || insert.fontSize !== undefined || insert.fontColor !== undefined;
+        if (hasStyle && baseCharPrXml) {
+          const styleKey = JSON.stringify({ bold: insert.bold, italic: insert.italic, underline: insert.underline, fontSize: insert.fontSize, fontColor: insert.fontColor });
+          if (charPrCache.has(styleKey)) {
+            charPrIDRef = String(charPrCache.get(styleKey));
+          } else {
+            const newId = ++maxCharPrId;
+            charPrCache.set(styleKey, newId);
+            charPrIDRef = String(newId);
+
+            // Clone base charPr and apply style
+            let cloned = baseCharPrXml.replace(/id="\d+"/, `id="${newId}"`);
+            if (insert.fontSize) {
+              const heightVal = Math.round(insert.fontSize * 100);
+              cloned = cloned.replace(/height="\d+"/, `height="${heightVal}"`);
+            }
+            if (insert.fontColor) {
+              cloned = cloned.replace(/textColor="[^"]*"/, `textColor="#${insert.fontColor}"`);
+            }
+            if (insert.bold) {
+              if (!cloned.includes('<hh:bold')) cloned = cloned.replace('</hh:charPr>', '<hh:bold/></hh:charPr>');
+            } else if (insert.bold === false) {
+              cloned = cloned.replace(/<hh:bold[^/]*\/>/g, '');
+            }
+            if (insert.italic) {
+              if (!cloned.includes('<hh:italic')) cloned = cloned.replace('</hh:charPr>', '<hh:italic/></hh:charPr>');
+            } else if (insert.italic === false) {
+              cloned = cloned.replace(/<hh:italic[^/]*\/>/g, '');
+            }
+            if (insert.underline) {
+              if (!cloned.includes('<hh:underline')) cloned = cloned.replace('</hh:charPr>', '<hh:underline/></hh:charPr>');
+            } else if (insert.underline === false) {
+              cloned = cloned.replace(/<hh:underline[^/]*\/>/g, '');
+            }
+            newCharPrs.push(cloned);
+          }
+        }
+
         // Build paragraph XML
         const pageBreakVal = insert.pageBreak ? '1' : '0';
-        const paragraphXml = `<hp:p id="${insert.paragraphId}" paraPrIDRef="0" styleIDRef="0" pageBreak="${pageBreakVal}" columnBreak="0" merged="0"><hp:run charPrIDRef="0"><hp:t>${escapedText}</hp:t></hp:run></hp:p>`;
+        const paragraphXml = `<hp:p id="${insert.paragraphId}" paraPrIDRef="0" styleIDRef="0" pageBreak="${pageBreakVal}" columnBreak="0" merged="0"><hp:run charPrIDRef="${charPrIDRef}"><hp:t>${escapedText}</hp:t></hp:run></hp:p>`;
 
         // Find the position to insert
         let insertPosition = -1;
@@ -5812,6 +6050,21 @@ export class HwpxDocument {
       }
 
       this._zip.file(sectionPath, xml);
+    }
+
+    // Write new charPr entries into <hh:charProperties> in header.xml
+    if (newCharPrs.length > 0 && headerXml) {
+      // Update itemCnt FIRST (before inserting content changes string offsets)
+      headerXml = headerXml.replace(
+        /<hh:charProperties\s+itemCnt="(\d+)"/,
+        (_match: string, cnt: string) => `<hh:charProperties itemCnt="${parseInt(cnt, 10) + newCharPrs.length}"`
+      );
+      // Then insert new charPr entries before </hh:charProperties>
+      headerXml = headerXml.replace(
+        '</hh:charProperties>',
+        newCharPrs.join('\n') + '\n</hh:charProperties>'
+      );
+      this._zip.file('Contents/header.xml', headerXml);
     }
   }
 
@@ -6603,11 +6856,14 @@ export class HwpxDocument {
         maxBorderFillId++;
         colorToId.set(update.backgroundColor, maxBorderFillId);
         newBorderFills.push(`      <hh:borderFill id="${maxBorderFillId}" threeD="0" shadow="0" centerLine="NONE" breakCellSeparateLine="0">
+        <hh:slash type="NONE" Crooked="0" isCounter="0"/>
+        <hh:backSlash type="NONE" Crooked="0" isCounter="0"/>
         <hh:leftBorder type="SOLID" width="0.12mm" color="#000000"/>
         <hh:rightBorder type="SOLID" width="0.12mm" color="#000000"/>
         <hh:topBorder type="SOLID" width="0.12mm" color="#000000"/>
         <hh:bottomBorder type="SOLID" width="0.12mm" color="#000000"/>
-        <hh:fillBrush><hh:winBrush faceColor="#${update.backgroundColor}" hatchColor="#000000" alpha="0"/></hh:fillBrush>
+        <hh:diagonal type="NONE" width="0.1mm" color="#000000"/>
+        <hc:fillBrush><hc:winBrush faceColor="#${update.backgroundColor}" hatchColor="#000000" alpha="0"/></hc:fillBrush>
       </hh:borderFill>`);
       }
     }
@@ -12330,6 +12586,13 @@ export class HwpxDocument {
       const align = update.style.align ? alignMap[update.style.align.toLowerCase()] || 'LEFT' : 'LEFT';
       const lineSpacing = update.style.lineSpacing ?? 160; // default 160%
 
+      // Convert pt values to hwpunit (1pt = 100 hwpunit)
+      const marginLeftHwp = Math.round((update.style.marginLeft ?? 0) * 100);
+      const marginRightHwp = Math.round((update.style.marginRight ?? 0) * 100);
+      const marginTopHwp = Math.round((update.style.marginTop ?? 0) * 100);
+      const marginBottomHwp = Math.round((update.style.marginBottom ?? 0) * 100);
+      const firstLineIndentHwp = Math.round((update.style.firstLineIndent ?? 0) * 100);
+
       // Build paraPr element with hp:switch structure for Hangul compatibility
       // Korean word processor requires this structure to properly recognize paragraph styles
       const paraPrXml = `<hh:paraPr id="${newId}" tabPrIDRef="0" condense="0" fontLineHeight="0" snapToGrid="1" suppressLineNumbers="0" checked="0" textDir="AUTO">
@@ -12340,21 +12603,21 @@ export class HwpxDocument {
         <hp:switch>
           <hp:case hp:required-namespace="http://www.hancom.co.kr/hwpml/2016/HwpUnitChar">
             <hh:margin>
-              <hc:intent value="0" unit="HWPUNIT"/>
-              <hc:left value="0" unit="HWPUNIT"/>
-              <hc:right value="0" unit="HWPUNIT"/>
-              <hc:prev value="0" unit="HWPUNIT"/>
-              <hc:next value="0" unit="HWPUNIT"/>
+              <hc:intent value="${firstLineIndentHwp}" unit="HWPUNIT"/>
+              <hc:left value="${marginLeftHwp}" unit="HWPUNIT"/>
+              <hc:right value="${marginRightHwp}" unit="HWPUNIT"/>
+              <hc:prev value="${marginTopHwp}" unit="HWPUNIT"/>
+              <hc:next value="${marginBottomHwp}" unit="HWPUNIT"/>
             </hh:margin>
             <hh:lineSpacing type="PERCENT" value="${lineSpacing}" unit="HWPUNIT"/>
           </hp:case>
           <hp:default>
             <hh:margin>
-              <hc:intent value="0" unit="HWPUNIT"/>
-              <hc:left value="0" unit="HWPUNIT"/>
-              <hc:right value="0" unit="HWPUNIT"/>
-              <hc:prev value="0" unit="HWPUNIT"/>
-              <hc:next value="0" unit="HWPUNIT"/>
+              <hc:intent value="${firstLineIndentHwp}" unit="HWPUNIT"/>
+              <hc:left value="${marginLeftHwp}" unit="HWPUNIT"/>
+              <hc:right value="${marginRightHwp}" unit="HWPUNIT"/>
+              <hc:prev value="${marginTopHwp}" unit="HWPUNIT"/>
+              <hc:next value="${marginBottomHwp}" unit="HWPUNIT"/>
             </hh:margin>
             <hh:lineSpacing type="PERCENT" value="${lineSpacing}" unit="HWPUNIT"/>
           </hp:default>
@@ -12425,6 +12688,365 @@ export class HwpxDocument {
       }
 
       this._zip.file(sectionPath, sectionXml);
+    }
+  }
+
+  /**
+   * Apply character styles to table cell paragraphs in XML.
+   * Reuses the charPr cloning approach from applyCharacterStylesToXml but
+   * targets paragraphs inside table cells instead of top-level elements.
+   */
+  private async applyTableCellCharacterStylesToXml(): Promise<void> {
+    if (!this._zip || this._pendingTableCellCharacterStyles.length === 0) return;
+
+    const headerPath = 'Contents/header.xml';
+    let headerXml = await this._zip.file(headerPath)?.async('string');
+    if (!headerXml) return;
+
+    // Find max charPr id
+    const charPrIdRegex = /<hh:charPr\s+[^>]*id="(\d+)"/g;
+    let maxCharPrId = 0;
+    let match;
+    while ((match = charPrIdRegex.exec(headerXml)) !== null) {
+      maxCharPrId = Math.max(maxCharPrId, parseInt(match[1], 10));
+    }
+    const charShapeIdRegex = /<hh:charShape\s+[^>]*id="(\d+)"/g;
+    while ((match = charShapeIdRegex.exec(headerXml)) !== null) {
+      maxCharPrId = Math.max(maxCharPrId, parseInt(match[1], 10));
+    }
+
+    // Read base charPr (id=0) as template
+    const baseCharPrMatch = headerXml.match(/<hh:charPr\s+[^>]*id="0"[^>]*>([\s\S]*?)<\/hh:charPr>/);
+    let baseInnerXml = '';
+    if (baseCharPrMatch) {
+      baseInnerXml = baseCharPrMatch[1].replace(/<hh:fontRef[^/]*\/>/g, '').trim();
+    }
+
+    const styleToIdMap = new Map<string, number>();
+    const newCharPrs: string[] = [];
+
+    // Group by section
+    const updatesBySection = new Map<number, PendingTableCellCharacterStyle[]>();
+    for (const update of this._pendingTableCellCharacterStyles) {
+      if (!updatesBySection.has(update.sectionIndex)) {
+        updatesBySection.set(update.sectionIndex, []);
+      }
+      updatesBySection.get(update.sectionIndex)!.push(update);
+    }
+
+    for (const [sectionIndex, updates] of updatesBySection) {
+      const sectionPath = `Contents/section${sectionIndex}.xml`;
+      let sectionXml = await this._zip.file(sectionPath)?.async('string');
+      if (!sectionXml) continue;
+
+      for (const update of updates) {
+        // Recompute table offsets each iteration because prior updates may have shifted them
+        const allTables = this.findAllTables(sectionXml);
+        if (update.tableIndex >= allTables.length) continue;
+        const tableInfo = allTables[update.tableIndex];
+        const tableXml = tableInfo.xml;
+        const tableStart = tableInfo.startIndex;
+
+        // Find the target cell by walking <hp:tr> rows then <hp:tc> columns
+        // This avoids row-major flattening which breaks with merged cells
+        const prefix = tableXml.match(/<(hp|hs):tbl/)?.[1] || 'hp';
+        const trOpenTag = `<${prefix}:tr`;
+        const trCloseTag = `</${prefix}:tr>`;
+        const tcOpenTag = `<${prefix}:tc`;
+        const tcCloseTag = `</${prefix}:tc>`;
+        const tblOpenTag = `<${prefix}:tbl`;
+        const tblCloseTag = `</${prefix}:tbl>`;
+
+        // Find direct rows (skip nested table rows)
+        const directRows: Array<{ start: number; end: number }> = [];
+        {
+          let pos = tableXml.indexOf('>', 0);
+          if (pos < 0) continue;
+          pos++;
+          let nestedDepth = 0;
+
+          while (pos < tableXml.length) {
+            const nextTblOpen = tableXml.indexOf(tblOpenTag, pos);
+            const nextTblClose = tableXml.indexOf(tblCloseTag, pos);
+            const nextTrOpen = tableXml.indexOf(trOpenTag, pos);
+
+            const candidates = [
+              nextTblOpen >= 0 ? { type: 'tblOpen' as const, idx: nextTblOpen } : null,
+              nextTblClose >= 0 ? { type: 'tblClose' as const, idx: nextTblClose } : null,
+              nextTrOpen >= 0 ? { type: 'trOpen' as const, idx: nextTrOpen } : null,
+            ].filter(Boolean).sort((a, b) => a!.idx - b!.idx);
+
+            if (candidates.length === 0) break;
+            const next = candidates[0]!;
+
+            if (next.type === 'tblOpen') {
+              nestedDepth++;
+              pos = next.idx + tblOpenTag.length;
+            } else if (next.type === 'tblClose') {
+              if (nestedDepth > 0) nestedDepth--;
+              else break; // end of this table
+              pos = next.idx + tblCloseTag.length;
+            } else if (next.type === 'trOpen' && nestedDepth === 0) {
+              // Find matching </hp:tr> at same depth
+              let trDepth = 1;
+              let sp = next.idx + trOpenTag.length;
+              while (trDepth > 0 && sp < tableXml.length) {
+                const nOpen = tableXml.indexOf(trOpenTag, sp);
+                const nClose = tableXml.indexOf(trCloseTag, sp);
+                if (nClose < 0) break;
+                if (nOpen >= 0 && nOpen < nClose) { trDepth++; sp = nOpen + trOpenTag.length; }
+                else { trDepth--; if (trDepth === 0) directRows.push({ start: next.idx, end: nClose + trCloseTag.length }); sp = nClose + trCloseTag.length; }
+              }
+              pos = directRows.length > 0 ? directRows[directRows.length - 1].end : next.idx + 1;
+            } else {
+              pos = next.idx + 1;
+            }
+          }
+        }
+
+        if (update.row >= directRows.length) continue;
+        const rowInfo = directRows[update.row];
+        const rowXml = tableXml.slice(rowInfo.start, rowInfo.end);
+
+        // Find direct cells within this row (skip nested table cells)
+        const directCellsInRow: Array<{ start: number; end: number }> = [];
+        {
+          let pos = rowXml.indexOf('>', 0);
+          if (pos < 0) continue;
+          pos++;
+          let nestedDepth = 0;
+
+          while (pos < rowXml.length) {
+            const nextTblOpen = rowXml.indexOf(tblOpenTag, pos);
+            const nextTblClose = rowXml.indexOf(tblCloseTag, pos);
+            const nextTcOpen = rowXml.indexOf(tcOpenTag, pos);
+
+            const candidates = [
+              nextTblOpen >= 0 ? { type: 'tblOpen' as const, idx: nextTblOpen } : null,
+              nextTblClose >= 0 ? { type: 'tblClose' as const, idx: nextTblClose } : null,
+              nextTcOpen >= 0 ? { type: 'tcOpen' as const, idx: nextTcOpen } : null,
+            ].filter(Boolean).sort((a, b) => a!.idx - b!.idx);
+
+            if (candidates.length === 0) break;
+            const next = candidates[0]!;
+
+            if (next.type === 'tblOpen') {
+              nestedDepth++;
+              pos = next.idx + tblOpenTag.length;
+            } else if (next.type === 'tblClose') {
+              if (nestedDepth > 0) nestedDepth--;
+              pos = next.idx + tblCloseTag.length;
+            } else if (next.type === 'tcOpen' && nestedDepth === 0) {
+              let tcDepth = 1;
+              let sp = next.idx + tcOpenTag.length;
+              while (tcDepth > 0 && sp < rowXml.length) {
+                const nOpen = rowXml.indexOf(tcOpenTag, sp);
+                const nClose = rowXml.indexOf(tcCloseTag, sp);
+                if (nClose < 0) break;
+                if (nOpen >= 0 && nOpen < nClose) { tcDepth++; sp = nOpen + tcOpenTag.length; }
+                else { tcDepth--; if (tcDepth === 0) directCellsInRow.push({ start: next.idx, end: nClose + tcCloseTag.length }); sp = nClose + tcCloseTag.length; }
+              }
+              pos = directCellsInRow.length > 0 ? directCellsInRow[directCellsInRow.length - 1].end : next.idx + 1;
+            } else {
+              pos = next.idx + 1;
+            }
+          }
+        }
+
+        if (update.col >= directCellsInRow.length) continue;
+        const cellInfo = { start: rowInfo.start + directCellsInRow[update.col].start, end: rowInfo.start + directCellsInRow[update.col].end };
+        const cellXml = tableXml.slice(cellInfo.start, cellInfo.end);
+
+        // Find target paragraph within cell — depth-aware to skip nested table paragraphs
+        let pStart = -1;
+        {
+          let pCount = 0;
+          let pos = cellXml.indexOf('>', 0);
+          if (pos < 0) continue;
+          pos++;
+          let nestedDepth = 0;
+
+          while (pos < cellXml.length) {
+            const nextTblOpen = cellXml.indexOf(tblOpenTag, pos);
+            const nextTblClose = cellXml.indexOf(tblCloseTag, pos);
+            const nextPOpen = cellXml.indexOf(`<${prefix}:p`, pos);
+
+            const candidates = [
+              nextTblOpen >= 0 ? { type: 'tblOpen' as const, idx: nextTblOpen } : null,
+              nextTblClose >= 0 ? { type: 'tblClose' as const, idx: nextTblClose } : null,
+              nextPOpen >= 0 ? { type: 'pOpen' as const, idx: nextPOpen } : null,
+            ].filter(Boolean).sort((a, b) => a!.idx - b!.idx);
+
+            if (candidates.length === 0) break;
+            const next = candidates[0]!;
+
+            if (next.type === 'tblOpen') {
+              nestedDepth++;
+              pos = next.idx + tblOpenTag.length;
+            } else if (next.type === 'tblClose') {
+              if (nestedDepth > 0) nestedDepth--;
+              pos = next.idx + tblCloseTag.length;
+            } else if (next.type === 'pOpen' && nestedDepth === 0) {
+              if (pCount === update.paragraphIndex) {
+                pStart = next.idx;
+                break;
+              }
+              pCount++;
+              pos = next.idx + 1;
+            } else {
+              pos = next.idx + 1;
+            }
+          }
+        }
+        if (pStart < 0) continue; // Bug 3 fix: skip if paragraph not found
+
+        const pEndIdx = cellXml.indexOf(`</${prefix}:p>`, pStart);
+        if (pEndIdx < 0) continue;
+        const paraXml = cellXml.slice(pStart, pEndIdx);
+
+        // Find original charPrIDRef of target run
+        const paraRunRegex = new RegExp(`<${prefix}:run\\s[^>]*charPrIDRef="(\\d+)"[^>]*`, 'g');
+        let origCharPrIDRef = '0';
+        let runMatch2;
+        let paraRunCount = 0;
+        while ((runMatch2 = paraRunRegex.exec(paraXml)) !== null) {
+          if (paraRunCount === update.runIndex) {
+            origCharPrIDRef = runMatch2[1];
+            break;
+          }
+          paraRunCount++;
+        }
+
+        // Create new charPr by cloning original and applying style overlay
+        // Search both charPr and charShape formats (some documents use charShapeList)
+        const styleKey = `orig:${origCharPrIDRef}-` + JSON.stringify(update.style);
+        let charPrId: number;
+        if (styleToIdMap.has(styleKey)) {
+          charPrId = styleToIdMap.get(styleKey)!;
+        } else {
+          charPrId = ++maxCharPrId;
+          styleToIdMap.set(styleKey, charPrId);
+
+          const origRegex = new RegExp(`<hh:(?:charPr|charShape)\\s+[^>]*id="${origCharPrIDRef}"[^>]*>[\\s\\S]*?</hh:(?:charPr|charShape)>`);
+          const origMatch = origRegex.exec(headerXml);
+          let newCharPr: string;
+
+          if (origMatch) {
+            newCharPr = origMatch[0].replace(/id="\d+"/, `id="${charPrId}"`);
+            // Normalize charShape → charPr tag name so it goes into charProperties
+            newCharPr = newCharPr.replace(/<hh:charShape\b/g, '<hh:charPr');
+            newCharPr = newCharPr.replace(/<\/hh:charShape>/g, '</hh:charPr>');
+            // Use child element pattern (<hh:bold/>, <hh:italic/>, <hh:underline/>)
+            // consistent with applyRunSplitsToXml and applyCharacterStylesToXml
+            if (update.style.bold) {
+              if (!newCharPr.includes('<hh:bold')) {
+                newCharPr = newCharPr.replace('</hh:charPr>', '<hh:bold/></hh:charPr>');
+              }
+            } else if (update.style.bold === false) {
+              newCharPr = newCharPr.replace(/<hh:bold[^/]*\/>/g, '');
+            }
+            if (update.style.italic) {
+              if (!newCharPr.includes('<hh:italic')) {
+                newCharPr = newCharPr.replace('</hh:charPr>', '<hh:italic/></hh:charPr>');
+              }
+            } else if (update.style.italic === false) {
+              newCharPr = newCharPr.replace(/<hh:italic[^/]*\/>/g, '');
+            }
+            if (update.style.underline) {
+              if (!newCharPr.includes('<hh:underline')) {
+                newCharPr = newCharPr.replace('</hh:charPr>', '<hh:underline/></hh:charPr>');
+              }
+            } else if (update.style.underline === false) {
+              newCharPr = newCharPr.replace(/<hh:underline[^/]*\/>/g, '');
+            }
+            if (update.style.fontSize) {
+              const sizeHwp = Math.round(update.style.fontSize * 100);
+              newCharPr = newCharPr.replace(/height="\d+"/g, `height="${sizeHwp}"`);
+              newCharPr = newCharPr.replace(/baseSize="\d+"/, `baseSize="${sizeHwp}"`);
+            }
+            if (update.style.fontColor) {
+              const color = update.style.fontColor.replace('#', '');
+              newCharPr = newCharPr.replace(/textColor="[^"]*"/, `textColor="#${color}"`);
+              if (!newCharPr.includes('textColor=')) {
+                newCharPr = newCharPr.replace(/<hh:charPr\s/, `<hh:charPr textColor="#${color}" `);
+              }
+            }
+          } else {
+            // Fallback: create minimal charPr with child elements
+            const sizeHwp = update.style.fontSize ? Math.round(update.style.fontSize * 100) : 1000;
+            const color = update.style.fontColor?.replace('#', '') || '000000';
+            let charPrXml = `<hh:charPr id="${charPrId}" height="${sizeHwp}" textColor="#${color}" shadeColor="none" useFontSpace="0" useKerning="0" symMark="NONE" borderFillIDRef="1">`;
+            if (update.style.bold) charPrXml += '<hh:bold/>';
+            if (update.style.italic) charPrXml += '<hh:italic/>';
+            if (update.style.underline) charPrXml += '<hh:underline/>';
+            charPrXml += `${baseInnerXml}</hh:charPr>`;
+            newCharPr = charPrXml;
+          }
+
+          newCharPrs.push(newCharPr);
+        }
+
+        // Update charPrIDRef in section XML for the target run
+        const absolutePStart = tableStart + cellInfo.start + pStart;
+        const absoluteParaXml: string = sectionXml.slice(absolutePStart, absolutePStart + paraXml.length);
+
+        let runIdx = 0;
+        const replaceRunRegex = new RegExp(`(<${prefix}:run\\s[^>]*charPrIDRef=")(\\d+)(")`, 'g');
+        const newParaXml: string = absoluteParaXml.replace(replaceRunRegex, (fullMatch: string, pfx: string, id: string, sfx: string) => {
+          if (runIdx++ === update.runIndex) {
+            return `${pfx}${charPrId}${sfx}`;
+          }
+          return fullMatch;
+        });
+
+        sectionXml = sectionXml.slice(0, absolutePStart) + newParaXml + sectionXml.slice(absolutePStart + paraXml.length);
+      }
+
+      this._zip.file(sectionPath, sectionXml);
+    }
+
+    // Insert new charPrs into header.xml
+    if (newCharPrs.length > 0) {
+      const charPropsInsertPoint = headerXml.indexOf('</hh:charProperties>');
+
+      if (charPropsInsertPoint !== -1) {
+        // charProperties container exists — insert as charPr (normal case)
+        const itemCntMatch = headerXml.match(/<hh:charProperties\s+itemCnt="(\d+)"/);
+        const oldCount = itemCntMatch ? parseInt(itemCntMatch[1], 10) : 0;
+        headerXml = headerXml.replace(
+          /<hh:charProperties\s+itemCnt="(\d+)"/,
+          `<hh:charProperties itemCnt="${oldCount + newCharPrs.length}"`
+        );
+        headerXml = headerXml.substring(0, charPropsInsertPoint) +
+          newCharPrs.join('\n') + '\n' +
+          headerXml.substring(charPropsInsertPoint);
+      } else {
+        // No charProperties — try charShapeList, or create charProperties as last resort
+        const charShapeListInsertPoint = headerXml.indexOf('</hh:charShapeList>');
+        if (charShapeListInsertPoint !== -1) {
+          // charShapeList-only document — insert as charShape
+          const convertedCharShapes = newCharPrs.map(cp =>
+            cp.replace(/<hh:charPr\b/g, '<hh:charShape').replace(/<\/hh:charPr>/g, '</hh:charShape>')
+          );
+          const shapeItemCntMatch = headerXml.match(/<hh:charShapeList\s+itemCnt="(\d+)"/);
+          const oldShapeCount = shapeItemCntMatch ? parseInt(shapeItemCntMatch[1], 10) : 0;
+          headerXml = headerXml.replace(
+            /<hh:charShapeList\s+itemCnt="(\d+)"/,
+            `<hh:charShapeList itemCnt="${oldShapeCount + convertedCharShapes.length}"`
+          );
+          headerXml = headerXml.substring(0, charShapeListInsertPoint) +
+            convertedCharShapes.join('\n') + '\n' +
+            headerXml.substring(charShapeListInsertPoint);
+        } else {
+          // Neither container exists — create charProperties section before </hh:head> or </head>
+          const headCloseIdx = headerXml.indexOf('</hh:head>');
+          if (headCloseIdx !== -1) {
+            const newSection = `<hh:charProperties itemCnt="${newCharPrs.length}">\n${newCharPrs.join('\n')}\n</hh:charProperties>\n`;
+            headerXml = headerXml.substring(0, headCloseIdx) + newSection + headerXml.substring(headCloseIdx);
+          }
+        }
+      }
+      this._zip.file(headerPath, headerXml);
     }
   }
 

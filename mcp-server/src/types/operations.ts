@@ -141,12 +141,33 @@ export interface PendingParagraphInsert {
   paragraphId: string;
   text: string;
   pageBreak?: boolean;
+  // Inline paragraph style (optional) — avoids separate set_paragraph_style call
+  align?: string;
+  marginLeft?: number;   // in pt
+  marginRight?: number;  // in pt
+  lineSpacing?: number;  // in %
+  // Inline character style (optional) — avoids separate set_text_style call
+  bold?: boolean;
+  italic?: boolean;
+  underline?: boolean;
+  fontSize?: number;     // in pt
+  fontColor?: string;    // hex
 }
 
 export interface PendingParagraphStyle {
   sectionIndex: number;
   elementIndex: number;
   style: Partial<ParagraphStyle>;
+}
+
+export interface PendingTableCellCharacterStyle {
+  sectionIndex: number;
+  tableIndex: number;
+  row: number;
+  col: number;
+  paragraphIndex: number;
+  runIndex: number;
+  style: Partial<CharacterStyle>;
 }
 
 export interface PendingCharacterStyle {

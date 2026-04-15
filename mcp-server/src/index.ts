@@ -211,7 +211,7 @@ Example: get_tool_guide({ workflow: "template" })`,
   },
   {
     name: 'insert_paragraph',
-    description: 'Insert a new paragraph (HWPX only). Automatically applies hanging indent if text contains a marker like "○ ", "1. ", "가. ", etc.',
+    description: 'Insert a new paragraph with optional inline styles (HWPX only). Supports paragraph style (align, margin) and text style (bold, font_size) in a single call, reducing the need for separate set_paragraph_style/set_text_style calls.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -220,6 +220,17 @@ Example: get_tool_guide({ workflow: "template" })`,
         after_index: { type: 'number', description: 'Insert after this paragraph index (-1 for beginning)' },
         text: { type: 'string', description: 'Paragraph text' },
         auto_hanging_indent: { type: 'boolean', description: 'Automatically apply hanging indent if marker detected (default: true)' },
+        // Inline paragraph style
+        align: { type: 'string', enum: ['left', 'center', 'right', 'justify', 'distribute'], description: 'Text alignment' },
+        margin_left: { type: 'number', description: 'Left margin in pt' },
+        margin_right: { type: 'number', description: 'Right margin in pt' },
+        line_spacing: { type: 'number', description: 'Line spacing in %' },
+        // Inline text style
+        bold: { type: 'boolean', description: 'Bold' },
+        italic: { type: 'boolean', description: 'Italic' },
+        underline: { type: 'boolean', description: 'Underline' },
+        font_size: { type: 'number', description: 'Font size in pt' },
+        font_color: { type: 'string', description: 'Text color (hex)' },
       },
       required: ['doc_id', 'section_index', 'after_index', 'text'],
     },
@@ -313,14 +324,19 @@ Example: Paragraph with "Hello" (bold) + " World" (normal)
   // === Character Styling ===
   {
     name: 'set_text_style',
-    description: 'Apply character formatting to a paragraph run (HWPX only)',
+    description: 'Apply character formatting to a paragraph run (HWPX only). Can target both top-level paragraphs and table cell paragraphs. For table cells, provide table_index, row, col.',
     inputSchema: {
       type: 'object',
       properties: {
         doc_id: { type: 'string', description: 'Document ID' },
         section_index: { type: 'number', description: 'Section index' },
-        paragraph_index: { type: 'number', description: 'Paragraph index' },
+        paragraph_index: { type: 'number', description: 'Paragraph index (for top-level paragraphs or paragraph index within a cell)' },
         run_index: { type: 'number', description: 'Run index (default 0)' },
+        // Table cell targeting (optional)
+        table_index: { type: 'number', description: 'Table index (if targeting a cell paragraph)' },
+        row: { type: 'number', description: 'Row index (if targeting a cell paragraph)' },
+        col: { type: 'number', description: 'Column index (if targeting a cell paragraph)' },
+        // Style properties
         bold: { type: 'boolean', description: 'Bold' },
         italic: { type: 'boolean', description: 'Italic' },
         underline: { type: 'boolean', description: 'Underline' },
@@ -823,16 +839,13 @@ NOTE: This inserts AFTER the table, not inside it. To insert an image INSIDE a t
   },
   {
     name: 'update_table_cell',
-    description: `⭐ RECOMMENDED for template work with tables. Update cell content while PRESERVING existing styles.
+    description: `⭐ RECOMMENDED for template work with tables. Update cell content with optional inline styles.
 
 Features:
 - Preserves existing charPrIDRef (font styles) by default
 - Automatically applies hanging indent if text contains markers (○, 1., 가., etc.)
-- Resets lineseg for proper text layout
-
-For template/form work:
-- Use this to fill in table cell content
-- Original cell formatting remains unchanged`,
+- Supports inline text style (bold, font_size, font_color) to avoid separate set_text_style calls
+- Resets lineseg for proper text layout`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -844,6 +857,11 @@ For template/form work:
         text: { type: 'string', description: 'New cell content' },
         char_shape_id: { type: 'number', description: 'Character shape ID to apply (optional, uses existing style if omitted)' },
         auto_hanging_indent: { type: 'boolean', description: 'Automatically apply hanging indent if marker detected (default: true)' },
+        // Inline text style
+        bold: { type: 'boolean', description: 'Bold text in cell' },
+        italic: { type: 'boolean', description: 'Italic text in cell' },
+        font_size: { type: 'number', description: 'Font size in pt' },
+        font_color: { type: 'string', description: 'Text color (hex, e.g. "FFFFFF" for white)' },
       },
       required: ['doc_id', 'section_index', 'table_index', 'row', 'col', 'text'],
     },
@@ -1276,7 +1294,7 @@ batch_fill_table({
   // === Table Creation ===
   {
     name: 'insert_table',
-    description: 'Insert a new table (HWPX only). Use col_widths to specify individual column widths in hwpunit.',
+    description: 'Insert a new table with optional header row auto-styling (HWPX only). Use header_bg_color/header_font_color to auto-style the first row as a header.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1291,6 +1309,10 @@ batch_fill_table({
           items: { type: 'number' },
           description: 'Individual column widths in hwpunit. Array length must equal cols. Total becomes table width. Example: [10000, 15000, 17520] for 3 columns.'
         },
+        // Header auto-style
+        header_bg_color: { type: 'string', description: 'Header row background color (hex, e.g. "404040"). Auto-applies to all cells in row 0.' },
+        header_font_color: { type: 'string', description: 'Header row text color (hex, e.g. "FFFFFF" for white).' },
+        header_bold: { type: 'boolean', description: 'Header row bold text (default: true when header_bg_color is set)' },
       },
       required: ['doc_id', 'section_index', 'after_index', 'rows', 'cols'],
     },
@@ -2229,6 +2251,67 @@ Use after finding a position in the index to get the full chunk context.`,
     },
   },
   {
+    name: 'build_document',
+    description: `⭐ Build an entire document body in a SINGLE call. Instead of calling insert_paragraph 30+ times, pass all elements (paragraphs and tables) at once.
+
+Each element can be:
+- paragraph: text with optional inline styles (bold, font_size, align, margin_left, etc.)
+- table: rows/cols with optional header styling and cell data (2D array)
+
+Example:
+build_document({
+  doc_id: "...",
+  elements: [
+    { type: "paragraph", text: "제목", align: "center", bold: true, font_size: 20 },
+    { type: "paragraph", text: "1. 본문", bold: true, font_size: 16 },
+    { type: "table", rows: 3, cols: 2, header_bg_color: "404040", header_font_color: "FFFFFF",
+      data: [["구분", "내용"], ["항목1", "값1"], ["항목2", "값2"]] },
+    { type: "paragraph", text: "ㅇ 설명 텍스트", font_size: 11, margin_left: 8 }
+  ]
+})`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        doc_id: { type: 'string', description: 'Document ID' },
+        section_index: { type: 'number', description: 'Section index (default: 0)' },
+        after_index: { type: 'number', description: 'Insert after this element index. Omit to append at end. -1 for beginning.' },
+        elements: {
+          type: 'array',
+          description: 'Array of elements to insert (paragraphs and tables)',
+          items: {
+            type: 'object',
+            properties: {
+              type: { type: 'string', enum: ['paragraph', 'table'], description: 'Element type' },
+              // Paragraph properties
+              text: { type: 'string', description: 'Paragraph text' },
+              align: { type: 'string', enum: ['left', 'center', 'right', 'justify', 'distribute'], description: 'Text alignment' },
+              bold: { type: 'boolean', description: 'Bold' },
+              italic: { type: 'boolean', description: 'Italic' },
+              underline: { type: 'boolean', description: 'Underline' },
+              font_size: { type: 'number', description: 'Font size in pt' },
+              font_color: { type: 'string', description: 'Text color (hex)' },
+              margin_left: { type: 'number', description: 'Left margin in pt' },
+              margin_right: { type: 'number', description: 'Right margin in pt' },
+              margin_top: { type: 'number', description: 'Top margin in pt' },
+              margin_bottom: { type: 'number', description: 'Bottom margin in pt' },
+              line_spacing: { type: 'number', description: 'Line spacing in %' },
+              // Table properties
+              rows: { type: 'number', description: 'Number of rows (table only)' },
+              cols: { type: 'number', description: 'Number of columns (table only)' },
+              col_widths: { type: 'array', items: { type: 'number' }, description: 'Column widths in hwpunit (table only)' },
+              header_bg_color: { type: 'string', description: 'Header row background color hex (table only)' },
+              header_font_color: { type: 'string', description: 'Header row text color hex (table only)' },
+              header_align: { type: 'string', enum: ['left', 'center', 'right'], description: 'Header row text alignment (default: center when header_bg_color is set)' },
+              data: { type: 'array', items: { type: 'array', items: { type: 'string' } }, description: '2D array of cell text (table only)' },
+            },
+            required: ['type'],
+          },
+        },
+      },
+      required: ['doc_id', 'elements'],
+    },
+  },
+  {
     name: 'invalidate_reading_cache',
     description: `🔄 Clear cached chunks and position index.
 
@@ -2698,14 +2781,40 @@ Call get_tool_guide with: template, table, image, search, read, create`
         const autoHangingIndent = args?.auto_hanging_indent !== false;
         let indentPt = 0;
         if (autoHangingIndent) {
-          // Use async version to read font size from document
           indentPt = await doc.setAutoHangingIndentAsync(sectionIndex, index, 10);
         }
 
-        if (indentPt > 0) {
-          return success({ message: `Paragraph inserted with hanging indent: ${indentPt.toFixed(2)}pt`, index, indent_pt: indentPt });
+        // Apply inline paragraph style if provided
+        const hasParagraphStyle = args?.align || args?.margin_left || args?.margin_right || args?.line_spacing;
+        if (hasParagraphStyle) {
+          const pStyle: any = {};
+          if (args?.align) pStyle.align = args.align;
+          if (args?.margin_left) pStyle.marginLeft = args.margin_left;
+          if (args?.margin_right) pStyle.marginRight = args.margin_right;
+          if (args?.line_spacing) pStyle.lineSpacing = args.line_spacing;
+          doc.applyParagraphStyle(sectionIndex, index, pStyle);
         }
-        return success({ message: 'Paragraph inserted', index });
+
+        // Always reset bold/italic/underline to prevent inheriting from previous paragraph.
+        // insertParagraph copies charPrIDRef from the preceding paragraph, so without
+        // explicit reset a plain paragraph inserted after a bold heading stays bold.
+        // fontSize is only overridden when explicitly provided to preserve template defaults.
+        const tStyle: any = {
+          bold: args?.bold ?? false,
+          italic: args?.italic ?? false,
+          underline: args?.underline ?? false,
+        };
+        if (args?.font_size) tStyle.fontSize = args.font_size;
+        if (args?.font_color) tStyle.fontColor = args.font_color;
+        const hasTextStyle = args?.bold !== undefined || args?.italic !== undefined || args?.underline !== undefined || args?.font_size || args?.font_color;
+        doc.applyCharacterStyle(sectionIndex, index, 0, tStyle);
+
+        const msgs: string[] = ['Paragraph inserted'];
+        if (indentPt > 0) msgs.push(`hanging indent: ${indentPt.toFixed(2)}pt`);
+        if (hasParagraphStyle) msgs.push('paragraph style applied');
+        if (hasTextStyle) msgs.push('text style applied');
+
+        return success({ message: msgs.join(', '), index, ...(indentPt > 0 ? { indent_pt: indentPt } : {}) });
       }
 
       case 'delete_paragraph': {
@@ -2782,6 +2891,20 @@ Call get_tool_guide with: template, table, image, search, read, create`
         if (args?.font_size) style.fontSize = args.font_size;
         if (args?.font_color) style.fontColor = args.font_color;
         if (args?.background_color) style.backgroundColor = args.background_color;
+
+        // Table cell targeting
+        if (args?.table_index !== undefined && args?.row !== undefined && args?.col !== undefined) {
+          doc.applyTableCellCharacterStyle(
+            args.section_index as number,
+            args.table_index as number,
+            args.row as number,
+            args.col as number,
+            args?.paragraph_index as number ?? 0,
+            args?.run_index as number ?? 0,
+            style
+          );
+          return success({ message: 'Table cell text style applied' });
+        }
 
         doc.applyCharacterStyle(
           args?.section_index as number,
@@ -3266,13 +3389,30 @@ Call get_tool_guide with: template, table, image, search, read, create`
             }
           }
 
-          if (appliedIndents.length > 0) {
-            return success({
-              message: `Cell updated with hanging indent applied to ${appliedIndents.length} paragraph(s)`,
-              indent_pts: appliedIndents
-            });
+          // Apply inline text style if provided
+          const hasTextStyle = args?.bold !== undefined || args?.italic !== undefined || args?.font_size || args?.font_color;
+          if (hasTextStyle) {
+            const tStyle: any = {};
+            if (args?.bold !== undefined) tStyle.bold = args.bold;
+            if (args?.italic !== undefined) tStyle.italic = args.italic;
+            if (args?.font_size) tStyle.fontSize = args.font_size;
+            if (args?.font_color) tStyle.fontColor = args.font_color;
+            // Apply to all paragraphs in the cell (for multi-line content)
+            const text = args?.text as string;
+            const lineCount = text.split('\n').length;
+            for (let pi = 0; pi < lineCount; pi++) {
+              doc.applyTableCellCharacterStyle(sectionIndex, tableIndex, row, col, pi, 0, tStyle);
+            }
           }
-          return success({ message: 'Cell updated' });
+
+          const msgs: string[] = ['Cell updated'];
+          if (appliedIndents.length > 0) msgs.push(`hanging indent applied to ${appliedIndents.length} paragraph(s)`);
+          if (hasTextStyle) msgs.push('text style applied');
+
+          return success({
+            message: msgs.join(', '),
+            ...(appliedIndents.length > 0 ? { indent_pts: appliedIndents } : {}),
+          });
         }
       }
 
@@ -3715,18 +3855,44 @@ Call get_tool_guide with: template, table, image, search, read, create`
         if (!doc) return error('Document not found');
         if (doc.format === 'hwp') return error('HWP files are read-only');
 
+        const sectionIndex = args?.section_index as number;
+        const cols = args?.cols as number;
+
         const result = doc.insertTable(
-          args?.section_index as number,
+          sectionIndex,
           args?.after_index as number,
           args?.rows as number,
-          args?.cols as number,
+          cols,
           {
             width: args?.width as number | undefined,
             colWidths: args?.col_widths as number[] | undefined,
           }
         );
         if (!result) return error('Failed to insert table');
-        return success({ message: 'Table inserted', tableIndex: result.tableIndex });
+
+        // Auto-style header row if header_bg_color is provided
+        const headerBgColor = args?.header_bg_color as string | undefined;
+        if (headerBgColor) {
+          const headerFontColor = args?.header_font_color as string | undefined;
+          const headerBold = args?.header_bold !== false; // default true
+
+          for (let c = 0; c < cols; c++) {
+            // Apply background color
+            doc.setCellBackgroundColor(sectionIndex, result.tableIndex, 0, c, headerBgColor);
+
+            // Apply text style (bold + color)
+            const tStyle: any = {};
+            if (headerBold) tStyle.bold = true;
+            if (headerFontColor) tStyle.fontColor = headerFontColor;
+            if (Object.keys(tStyle).length > 0) {
+              doc.applyTableCellCharacterStyle(sectionIndex, result.tableIndex, 0, c, 0, 0, tStyle);
+            }
+          }
+        }
+
+        const msgs: string[] = ['Table inserted'];
+        if (headerBgColor) msgs.push('header styled');
+        return success({ message: msgs.join(', '), tableIndex: result.tableIndex });
       }
 
       case 'get_numbering_defs': {
@@ -4845,6 +5011,154 @@ Call get_tool_guide with: template, table, image, search, read, create`
 
         doc.invalidateReadingCache();
         return success({ success: true, message: 'Reading cache invalidated' });
+      }
+
+      case 'build_document': {
+        const doc = getDoc(args?.doc_id as string);
+        if (!doc) return error('Document not found');
+        if (doc.format === 'hwp') return error('HWP files are read-only');
+
+        const sectionIndex = (args?.section_index as number) ?? 0;
+        const elements = args?.elements as any[];
+        if (!elements || !Array.isArray(elements) || elements.length === 0) {
+          return error('elements array is required and must not be empty');
+        }
+
+        // Determine starting insertion point
+        let currentIndex: number;
+        if (args?.after_index !== undefined) {
+          currentIndex = args.after_index as number;
+        } else {
+          currentIndex = doc.getElementCount(sectionIndex) - 1;
+        }
+
+        const results: any[] = [];
+        let paragraphCount = 0;
+        let tableCount = 0;
+        let buildFailed = false;
+
+        try {
+          for (let i = 0; i < elements.length; i++) {
+            const el = elements[i];
+            if (el.type === 'paragraph') {
+              const text = el.text ?? '';
+
+              // Pass char style directly to insertParagraph so that
+              // applyParagraphInsertsToXml creates the correct charPrIDRef
+              // in a single step, avoiding the element index mismatch bug.
+              const charStyle: any = {
+                bold: el.bold ?? false,
+                italic: el.italic ?? false,
+                underline: el.underline ?? false,
+              };
+              if (el.font_size) charStyle.fontSize = el.font_size;
+              if (el.font_color) charStyle.fontColor = el.font_color;
+
+              const idx = doc.insertParagraph(sectionIndex, currentIndex, text, charStyle);
+              if (idx === -1) {
+                buildFailed = true;
+                results.push({ index: i, type: 'paragraph', success: false, error: 'Insert failed' });
+                break;
+              }
+
+              // Apply paragraph style
+              const pStyle: any = {};
+              if (el.align) pStyle.align = el.align;
+              if (el.margin_left) pStyle.marginLeft = el.margin_left;
+              if (el.margin_right) pStyle.marginRight = el.margin_right;
+              if (el.margin_top) pStyle.marginTop = el.margin_top;
+              if (el.margin_bottom) pStyle.marginBottom = el.margin_bottom;
+              if (el.line_spacing) pStyle.lineSpacing = el.line_spacing;
+              if (Object.keys(pStyle).length > 0) {
+                doc.applyParagraphStyle(sectionIndex, idx, pStyle);
+              }
+
+              // Flush to XML so subsequent indices are correct
+              await doc.flushPendingToXml();
+
+              currentIndex = idx;
+              paragraphCount++;
+              results.push({ index: i, type: 'paragraph', success: true, element_index: idx });
+
+            } else if (el.type === 'table') {
+              const rows = el.rows as number;
+              const cols = el.cols as number;
+              if (!rows || !cols) {
+                buildFailed = true;
+                results.push({ index: i, type: 'table', success: false, error: 'rows and cols required' });
+                break;
+              }
+
+              const tableResult = doc.insertTable(sectionIndex, currentIndex, rows, cols, {
+                width: el.width as number | undefined,
+                colWidths: el.col_widths as number[] | undefined,
+              });
+              if (!tableResult) {
+                buildFailed = true;
+                results.push({ index: i, type: 'table', success: false, error: 'Insert failed' });
+                break;
+              }
+
+              const tblIdx = tableResult.tableIndex;
+
+              // Fill cell data FIRST, then apply header style AFTER
+              if (el.data && Array.isArray(el.data)) {
+                for (let r = 0; r < el.data.length && r < rows; r++) {
+                  const row = el.data[r];
+                  if (!Array.isArray(row)) continue;
+                  for (let c = 0; c < row.length && c < cols; c++) {
+                    if (row[c] !== undefined && row[c] !== null) {
+                      doc.updateTableCell(sectionIndex, tblIdx, r, c, String(row[c]));
+                    }
+                  }
+                }
+              }
+
+              // Style header row AFTER data fill
+              if (el.header_bg_color) {
+                for (let c = 0; c < cols; c++) {
+                  doc.setCellBackgroundColor(sectionIndex, tblIdx, 0, c, el.header_bg_color);
+                  const hStyle: any = { bold: true };
+                  if (el.header_font_color) hStyle.fontColor = el.header_font_color;
+                  doc.applyTableCellCharacterStyle(sectionIndex, tblIdx, 0, c, 0, 0, hStyle);
+                }
+              }
+
+              // Flush to XML so subsequent indices are correct
+              await doc.flushPendingToXml();
+
+              // Apply header alignment after flush (requires table to exist in XML)
+              if (el.header_bg_color || el.header_align) {
+                const headerAlign = el.header_align as string || 'center';
+                await doc.setTableCellAlignmentInXml(sectionIndex, tblIdx, [0], cols, headerAlign);
+              }
+
+              currentIndex = currentIndex + 1;
+              tableCount++;
+              results.push({ index: i, type: 'table', success: true, table_index: tblIdx });
+            }
+          }
+        } catch (e: any) {
+          buildFailed = true;
+          results.push({ type: 'error', success: false, error: e.message });
+        }
+
+        // On failure, report partial results. Each element is flushed to XML
+        // immediately, so prior successful elements are already committed.
+        // The caller can close_document without saving to discard all changes.
+        if (buildFailed) {
+          const succeeded = results.filter(r => r.success).length;
+          const failed = results.filter(r => !r.success);
+          return error(`Build failed at element ${results.length - 1}. ${succeeded} elements were inserted before failure. Use close_document to discard, or save_document to keep partial results. Error: ${JSON.stringify(failed)}`);
+        }
+
+        return success({
+          message: `Built ${paragraphCount} paragraphs, ${tableCount} tables`,
+          paragraphs: paragraphCount,
+          tables: tableCount,
+          total: paragraphCount + tableCount,
+          results,
+        });
       }
 
       default:
