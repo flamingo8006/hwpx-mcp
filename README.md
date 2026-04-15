@@ -175,13 +175,42 @@ claude mcp add hwpx node /path/to/hwpx-mcp/mcp-server/dist/index.js
 
 ---
 
-## 3. 설치 확인
+## 3. 문서 작성 스킬 설치 (선택)
+
+`skills/hwpx-document-writer.md` 파일을 설치하면 AI가 `build_document` 도구를 활용하여 서식이 갖춰진 공문서를 **한 번의 호출로** 작성합니다.
+
+### Claude Code
+
+```bash
+# 방법 1: 프로젝트별 설치
+mkdir -p .claude/skills
+cp skills/hwpx-document-writer.md .claude/skills/
+
+# 방법 2: 전역 설치
+mkdir -p ~/.claude/skills/hwpx-document-writer
+cp skills/hwpx-document-writer.md ~/.claude/skills/hwpx-document-writer/skill.md
+```
+
+### Claude Desktop
+
+```bash
+# macOS
+cp skills/hwpx-document-writer.md ~/Library/Application\ Support/Claude/local-agent-mode-sessions/skills-plugin/*/skills/hwpx-document-writer/SKILL.md
+```
+
+### Codex / Gemini CLI (시스템 프롬프트)
+
+MCP 스킬을 지원하지 않는 클라이언트에서는 `skills/hwpx-document-writer.md`의 내용을 시스템 프롬프트에 포함시키면 동일한 효과를 얻을 수 있습니다.
+
+---
+
+## 4. 설치 확인
 
 클라이언트 재시작 후 MCP 도구 목록에서 `hwpx` 서버와 132개 도구가 표시되면 성공입니다.
 
 ---
 
-## 4. MCP 도구 목록 (132개)
+## 5. MCP 도구 목록 (132개)
 
 ### 문서 관리 (8개)
 
@@ -412,7 +441,7 @@ claude mcp add hwpx node /path/to/hwpx-mcp/mcp-server/dist/index.js
 
 ---
 
-## 5. 사용 예시
+## 6. 사용 예시
 
 ### 예시 1: 기본 문서 편집
 
@@ -494,7 +523,7 @@ AI 동작:
 
 ---
 
-## 6. 지원 포맷
+## 7. 지원 포맷
 
 | 포맷 | 확장자 | 읽기 | 쓰기 |
 |------|--------|:----:|:----:|
@@ -505,7 +534,7 @@ AI 동작:
 
 ---
 
-## 7. 알려진 제한사항
+## 8. 알려진 제한사항
 
 - **각주/미주/북마크/하이퍼링크 삽입**: 메모리에서만 동작, save 후 XML 미반영 (읽기는 정상)
 - **HWP 파일**: 지원하지 않음 (HWPX로 변환 필요)
@@ -513,7 +542,7 @@ AI 동작:
 
 ---
 
-## 8. 개발
+## 9. 개발
 
 ### 빌드
 
