@@ -1,20 +1,25 @@
+# OS
 .DS_Store
+
+# Dependencies
 node_modules/
+
+# Build output
 out/
 dist/
+mcp-server/dist/
+mcp-server/node_modules/
+
+# VSCode extension
 *.vsix
+
+# Temporary/debug files
 *.tmp
 *.bak
 .omc/
+.claude/
 test-output/
-test-temp*.hwpx
-test-format-text*.hwpx
-test-col-widths*.hwpx
-mcp-server/dist/
-mcp-server/node_modules/
-mcp-server/debug-*.txt
-mcp-server/debug-*.md
-mcp-server/debug-*.log
+mcp-server/test-output/
+mcp-server/debug-*
 mcp-server/*.mjs
 mcp-server/test-*.hwpx
-.claude/
