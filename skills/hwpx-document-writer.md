@@ -85,14 +85,35 @@ build_document({
 })
 ```
 
-### Step 3. 저장
+### Step 3. 저장 (필수)
+
+**반드시 save_document를 호출해야 파일이 디스크에 저장된다.** build_document만 호출하면 메모리에만 존재한다.
 
 ```
 save_document({ doc_id: "abc123", output_path: "/path/to/output.hwpx",
                 create_backup: true, verify_integrity: true })
 ```
 
+**저장 경로/파일명 기본 규칙 (사용자가 명시하지 않은 경우)**:
+
+- **경로**: `~/Downloads/` (macOS/Linux) 또는 `%USERPROFILE%\Downloads\` (Windows)
+- **파일명**: 문서 제목에서 자동 생성
+  - 공백 → 언더스코어(`_`)
+  - 특수문자 제거 (`/`, `\`, `:`, `*`, `?`, `"`, `<`, `>`, `|`)
+  - 확장자: `.hwpx`
+  - 예: "iM 유니즈 업무협약서 검토 보고" → `iM_유니즈_업무협약서_검토_보고.hwpx`
+  - 날짜가 필요하면: `회의록_2026-04-16.hwpx`
+
+**예시**:
+```
+사용자: "회의록 작성해서 저장해줘"
+→ save_document({ doc_id, output_path: "/Users/<user>/Downloads/회의록.hwpx",
+                  create_backup: true, verify_integrity: true })
+```
+
 **총 MCP 호출: 6회** (create + title 3병렬 + build_document + save)
+
+> **중요**: 사용자가 경로/파일명을 명시하지 않아도 **절대 물어보지 말고** 기본 규칙대로 저장한 뒤, 저장 완료 메시지에 경로를 포함해 알려준다.
 
 ---
 
