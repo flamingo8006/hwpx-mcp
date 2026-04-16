@@ -122,41 +122,38 @@ claude mcp add hwpx -- npx -y hwpx-mcp-server
 
 ## 2. 문서 작성 스킬 설치 (선택)
 
-`skills/hwpx-document-writer.md` 스킬을 설치하면 AI가 `build_document` 도구를 활용하여 서식이 갖춰진 한글 문서를 **한 번의 호출로** 작성합니다.
+스킬 파일을 설치하면 AI가 `build_document` 도구를 활용하여 서식이 갖춰진 한글 문서를 **한 번의 호출로** 작성합니다.
+
+스킬 파일 URL:
+`https://raw.githubusercontent.com/flamingo8006/hwpx-mcp/main/skills/hwpx-document-writer.md`
 
 ### Claude Code
 
 **macOS / Linux:**
 ```bash
 mkdir -p ~/.claude/skills/hwpx-document-writer
-curl -o ~/.claude/skills/hwpx-document-writer/skill.md https://raw.githubusercontent.com/flamingo8006/hwpx-mcp/main/skills/hwpx-document-writer.md
+curl -o ~/.claude/skills/hwpx-document-writer/skill.md \
+  https://raw.githubusercontent.com/flamingo8006/hwpx-mcp/main/skills/hwpx-document-writer.md
 ```
 
 **Windows (PowerShell):**
 ```powershell
 New-Item -ItemType Directory -Force -Path "$HOME\.claude\skills\hwpx-document-writer"
-curl.exe -o "$HOME\.claude\skills\hwpx-document-writer\skill.md" https://raw.githubusercontent.com/flamingo8006/hwpx-mcp/main/skills/hwpx-document-writer.md
+curl.exe -o "$HOME\.claude\skills\hwpx-document-writer\skill.md" `
+  https://raw.githubusercontent.com/flamingo8006/hwpx-mcp/main/skills/hwpx-document-writer.md
 ```
 
 ### Claude Desktop
 
-Claude Desktop은 공식적으로 커스텀 스킬을 지원하지 않습니다. 다음 두 가지 방법을 사용할 수 있습니다:
+Claude Desktop은 공식적으로 커스텀 스킬을 지원하지 않습니다. **프로젝트 Custom Instructions** 사용을 권장합니다:
 
-**방법 1: 프로젝트 Custom Instructions** (권장)
-1. Claude Desktop에서 **프로젝트 생성**
-2. 프로젝트 설정 → **Custom Instructions**
-3. [skills/hwpx-document-writer.md](skills/hwpx-document-writer.md) 내용을 붙여넣기
-
-**방법 2: 내부 스킬 폴더에 직접 복사** (비공식, 업데이트 시 초기화 가능)
-```bash
-# macOS
-cp hwpx-document-writer.md \
-  ~/Library/Application\ Support/Claude/local-agent-mode-sessions/skills-plugin/*/skills/hwpx-document-writer/SKILL.md
-```
+1. 위 URL에서 스킬 파일 내용을 복사
+2. Claude Desktop에서 **프로젝트 생성**
+3. 프로젝트 설정 → **Custom Instructions** 에 붙여넣기
 
 ### 기타 클라이언트 (Cursor / Codex / Gemini CLI)
 
-[skills/hwpx-document-writer.md](skills/hwpx-document-writer.md) 내용을 시스템 프롬프트에 포함시키면 동일한 효과를 얻을 수 있습니다.
+위 URL에서 스킬 파일 내용을 복사하여 시스템 프롬프트에 포함시키면 동일한 효과를 얻을 수 있습니다.
 
 ---
 
