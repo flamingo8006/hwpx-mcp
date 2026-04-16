@@ -58,27 +58,6 @@ npm run build
 }
 ```
 
-> **주의:** `mcpServers` 안에 다른 서버도 함께 설정할 때, **중첩하지 마세요.**
-> ```json
-> // 잘못된 예 - mcpServers가 중첩됨
-> {
->   "mcpServers": {
->     "other-server": { ... },
->     "mcpServers": {           // <-- 잘못!
->       "hwpx": { ... }
->     }
->   }
-> }
->
-> // 올바른 예 - 같은 레벨에 나열
-> {
->   "mcpServers": {
->     "other-server": { ... },
->     "hwpx": { ... }
->   }
-> }
-> ```
-
 ---
 
 ### Claude Code (CLI)

@@ -1,7 +1,7 @@
 {
   "name": "hwpx-mcp-server",
-  "version": "0.2.0",
-  "description": "MCP Server for HWPX document manipulation",
+  "version": "0.4.0",
+  "description": "MCP Server for HWPX (Korean Hangul) document editing - 132 tools for AI-powered document automation",
   "main": "dist/index.js",
   "bin": {
     "hwpx-mcp-server": "./dist/index.js"
@@ -9,8 +9,34 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
+    "prepublishOnly": "npm run build",
     "test": "vitest run",
     "test:watch": "vitest"
+  },
+  "keywords": [
+    "mcp",
+    "hwpx",
+    "hwp",
+    "hangul",
+    "korean",
+    "document",
+    "word-processor",
+    "ai",
+    "claude",
+    "model-context-protocol"
+  ],
+  "author": "flamingo99",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/flamingo8006/hwpx-mcp.git"
+  },
+  "files": [
+    "dist/",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
