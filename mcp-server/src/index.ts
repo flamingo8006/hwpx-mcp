@@ -7,7 +7,26 @@ import {
 } from '@modelcontextprotocol/sdk/types.js';
 import * as fs from 'fs';
 import * as path from 'path';
+import * as os from 'os';
 import { HwpxDocument, ImagePositionOptions } from './HwpxDocument';
+
+/**
+ * Expand ~ and environment variables in file paths.
+ * Supports: ~ → home directory, %USERPROFILE% / %APPDATA% → Windows env vars, $HOME etc.
+ */
+function expandPath(p: string | undefined): string | undefined {
+  if (!p) return p;
+  let expanded = p;
+  // Expand leading ~
+  if (expanded.startsWith('~/') || expanded === '~') {
+    expanded = path.join(os.homedir(), expanded.slice(1));
+  }
+  // Expand Windows-style %VAR%
+  expanded = expanded.replace(/%([^%]+)%/g, (_, name) => process.env[name] ?? `%${name}%`);
+  // Expand Unix-style $VAR and ${VAR}
+  expanded = expanded.replace(/\$\{?([A-Z_][A-Z0-9_]*)\}?/gi, (match, name) => process.env[name] ?? match);
+  return expanded;
+}
 import { HangingIndentCalculator } from './HangingIndentCalculator';
 
 // Version marker for debugging
@@ -2560,7 +2579,7 @@ Call get_tool_guide with: template, table, image, search, read, create`
 
       // === Document Management ===
       case 'open_document': {
-        const filePath = args?.file_path as string;
+        const filePath = expandPath(args?.file_path as string);
         if (!filePath) return error('file_path is required');
 
         const absolutePath = path.resolve(filePath);
@@ -2594,7 +2613,7 @@ Call get_tool_guide with: template, table, image, search, read, create`
         if (doc.format === 'hwp') return error('HWP files are read-only');
 
         {
-          const savePath = (args?.output_path as string) || doc.path;
+          const savePath = expandPath(args?.output_path as string) || doc.path;
           const createBackup = args?.create_backup !== false; // default: true
           const verifyIntegrity = args?.verify_integrity !== false; // default: true
           let backupPath: string | null = null;
@@ -3759,7 +3778,8 @@ Call get_tool_guide with: template, table, image, search, read, create`
         if (!doc) return error('Document not found');
 
         const text = doc.getAllText();
-        const outputPath = args?.output_path as string;
+        const outputPath = expandPath(args?.output_path as string);
+        if (!outputPath) return error('output_path is required');
         fs.writeFileSync(outputPath, text, 'utf-8');
         return success({ message: `Exported to ${outputPath}`, characters: text.length });
       }
@@ -3795,7 +3815,8 @@ Call get_tool_guide with: template, table, image, search, read, create`
         }
 
         html += '</body></html>';
-        const outputPath = args?.output_path as string;
+        const outputPath = expandPath(args?.output_path as string);
+        if (!outputPath) return error('output_path is required');
         fs.writeFileSync(outputPath, html, 'utf-8');
         return success({ message: `Exported to ${outputPath}` });
       }
@@ -4114,7 +4135,7 @@ Call get_tool_guide with: template, table, image, search, read, create`
         if (!doc) return error('Document not found');
         if (doc.format === 'hwp') return error('HWP files are read-only');
 
-        const imagePath = args?.image_path as string;
+        const imagePath = expandPath(args?.image_path as string) as string;
         if (!fs.existsSync(imagePath)) return error('Image file not found');
 
         // Resolve position using after_table, after_header, or direct indices
@@ -4329,7 +4350,7 @@ Call get_tool_guide with: template, table, image, search, read, create`
         if (!doc) return error('Document not found');
         if (doc.format === 'hwp') return error('HWP files are read-only');
 
-        const imagePath = args?.image_path as string;
+        const imagePath = expandPath(args?.image_path as string) as string;
         if (!fs.existsSync(imagePath)) return error('Image file not found');
 
         const globalTblIdx = args?.table_index as number;
