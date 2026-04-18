@@ -23,3 +23,7 @@ mcp-server/test-output/
 mcp-server/debug-*
 mcp-server/*.mjs
 mcp-server/test-*.hwpx
+
+# Secrets (HTTP mode deployment)
+mcp-server/.env
+mcp-server/.env.local

@@ -10,6 +10,21 @@ import * as path from 'path';
 import * as os from 'os';
 import { HwpxDocument, ImagePositionOptions } from './HwpxDocument';
 
+// Runtime mode: 'stdio' (local VSCode/Claude Desktop) or 'http' (remote server via reverse proxy)
+const MCP_MODE: 'stdio' | 'http' = process.env.MCP_MODE === 'http' ? 'http' : 'stdio';
+
+// Tools that touch the local filesystem directly. Disabled in HTTP mode so the
+// server cannot read/write disk paths supplied by untrusted remote clients.
+// In HTTP mode, use upload_document_base64 / download_document_base64 instead.
+const FILESYSTEM_TOOLS = new Set<string>([
+  'open_document',
+  'save_document',
+  'export_to_text',
+  'export_to_html',
+  'insert_image',
+  'insert_image_in_cell',
+]);
+
 /**
  * Expand ~ and environment variables in file paths.
  * Supports: ~ → home directory, %USERPROFILE% / %APPDATA% → Windows env vars, $HOME etc.
@@ -150,6 +165,41 @@ Example: get_tool_guide({ workflow: "template" })`,
     name: 'list_open_documents',
     description: 'List all currently open documents',
     inputSchema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'upload_document_base64',
+    description:
+      'Load an HWPX/HWP document from base64-encoded bytes into memory. ' +
+      'Returns doc_id for subsequent operations. ' +
+      'Use this in HTTP mode as the replacement for open_document (no local filesystem access).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        filename: {
+          type: 'string',
+          description: 'Logical filename (e.g. "report.hwpx"). Only used for format detection (.hwpx vs .hwp) and returned metadata.',
+        },
+        data_base64: {
+          type: 'string',
+          description: 'Base64-encoded file contents.',
+        },
+      },
+      required: ['filename', 'data_base64'],
+    },
+  },
+  {
+    name: 'download_document_base64',
+    description:
+      'Serialize the in-memory document to HWPX bytes and return as base64. ' +
+      'Use this in HTTP mode as the replacement for save_document (no local filesystem access). ' +
+      'HWPX only — HWP source files are read-only.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        doc_id: { type: 'string', description: 'Document ID' },
+      },
+      required: ['doc_id'],
+    },
   },
 
   // === Document Info ===
@@ -2349,20 +2399,6 @@ Call this after modifying the document to ensure fresh data on next read operati
 // Server Setup
 // ============================================================
 
-const server = new Server(
-  {
-    name: 'hwpx-mcp-server',
-    version: '0.3.0',
-  },
-  {
-    capabilities: {
-      tools: {},
-    },
-  }
-);
-
-server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools }));
-
 // ============================================================
 // Tool Handlers
 // ============================================================
@@ -2401,19 +2437,47 @@ const READ_ONLY_TOOLS = new Set([
   'get_numbering_defs', 'get_bullet_defs',
 ]);
 
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  const { name, arguments: args } = request.params;
+export function createServer(): Server {
+  const server = new Server(
+    {
+      name: 'hwpx-mcp-server',
+      version: '0.5.0',
+    },
+    {
+      capabilities: {
+        tools: {},
+      },
+    }
+  );
 
-  // Auto-lock: mutating tools acquire a per-document lock automatically
-  const docId = args?.doc_id as string | undefined;
-  if (docId && !READ_ONLY_TOOLS.has(name)) {
-    return withDocumentLock(docId, async () => {
-      return handleToolCall(name, args);
-    });
-  }
+  const visibleTools =
+    MCP_MODE === 'http' ? tools.filter((t) => !FILESYSTEM_TOOLS.has(t.name)) : tools;
 
-  return handleToolCall(name, args);
-});
+  server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: visibleTools }));
+
+  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    const { name, arguments: args } = request.params;
+
+    if (MCP_MODE === 'http' && FILESYSTEM_TOOLS.has(name)) {
+      return error(
+        `Tool '${name}' is disabled in HTTP mode. ` +
+          `Use upload_document_base64 / download_document_base64 for file I/O.`
+      );
+    }
+
+    // Auto-lock: mutating tools acquire a per-document lock automatically
+    const docId = args?.doc_id as string | undefined;
+    if (docId && !READ_ONLY_TOOLS.has(name)) {
+      return withDocumentLock(docId, async () => {
+        return handleToolCall(name, args);
+      });
+    }
+
+    return handleToolCall(name, args);
+  });
+
+  return server;
+}
 
 async function handleToolCall(name: string, args: Record<string, unknown> | undefined) {
   try {
@@ -2604,6 +2668,48 @@ Call get_tool_guide with: template, table, image, search, read, create`
           return success({ message: 'Document closed' });
         }
         return error('Document not found');
+      }
+
+      case 'upload_document_base64': {
+        const filename = (args?.filename as string) || '';
+        const dataB64 = args?.data_base64 as string;
+        if (!filename) return error('filename is required');
+        if (!dataB64) return error('data_base64 is required');
+
+        let buffer: Buffer;
+        try {
+          buffer = Buffer.from(dataB64, 'base64');
+        } catch {
+          return error('data_base64 is not valid base64');
+        }
+        if (buffer.length === 0) return error('decoded payload is empty');
+
+        const docId = generateId();
+        const doc = await HwpxDocument.createFromBuffer(docId, filename, buffer);
+        openDocuments.set(docId, doc);
+
+        return success({
+          doc_id: docId,
+          format: doc.format,
+          filename,
+          size_bytes: buffer.length,
+          structure: doc.getStructure(),
+          metadata: doc.getMetadata(),
+        });
+      }
+
+      case 'download_document_base64': {
+        const docId = args?.doc_id as string;
+        const doc = getDoc(docId);
+        if (!doc) return error('Document not found');
+        if (doc.format === 'hwp') return error('HWP files are read-only');
+
+        const buffer = await doc.save();
+        return success({
+          doc_id: docId,
+          data_base64: buffer.toString('base64'),
+          size_bytes: buffer.length,
+        });
       }
 
       case 'save_document': {
@@ -5220,8 +5326,29 @@ function escapeHtml(text: string): string {
 // ============================================================
 
 async function main() {
+  if (MCP_MODE === 'http') {
+    const { startHttpServer, parseTokens, parseAllowedOrigins } = await import('./transport/http');
+    const port = parseInt(process.env.MCP_PORT || '13701', 10);
+    const mcpPath = process.env.MCP_PATH || '/mcp';
+    const maxBodyMb = parseInt(process.env.MCP_MAX_BODY_MB || '50', 10);
+
+    await startHttpServer({
+      createServer,
+      port,
+      path: mcpPath,
+      tokens: parseTokens(),
+      allowedOrigins: parseAllowedOrigins(),
+      maxBodyMb,
+    });
+    return;
+  }
+
+  const server = createServer();
   const transport = new StdioServerTransport();
   await server.connect(transport);
 }
 
-main().catch(console.error);
+main().catch((err) => {
+  console.error('[HWPX MCP] Fatal:', err);
+  process.exit(1);
+});
