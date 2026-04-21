@@ -23,3 +23,8 @@ mcp-server/test-output/
 mcp-server/debug-*
 mcp-server/*.mjs
 mcp-server/test-*.hwpx
+
+# Environment / secrets
+.env
+.env.local
+mcp-server/.env
