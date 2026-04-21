@@ -73,8 +73,21 @@ Glob(pattern: "**/skills/templates/공문서.hwpx")
 | 셀 세로정렬 등 속성 | ❌ | `set_cell_properties` |
 | 표 셀 줄간격 | ❌ | 셀 paragraph에 `set_paragraph_style` |
 | 문자 범위 부분 서식 | ❌ (단락 단위만) | `format_text` (start_pos/end_pos) |
+| **inline font_size / bold / font_color** | ⚠️ **신뢰 불가** (아래 주의) | `set_text_style` 로 단락별 재적용 |
 
 > **폰트명 주의**: `format_text` 는 "must exist in document font list" 조건이 있음. `create_document` 직후 font list 에 HY헤드라인M/휴먼명조/한양중고딕이 없으면 `set_text_style` 쪽이 더 안전.
+
+> ⚠️ **`build_document` inline 스타일 버그 (2026-04-21 확인, hwpx-mcp-server@0.4.6)**:
+> `build_document` element 에 `font_size`, `bold`, `font_color` 를 inline 으로 주면 다음 두 가지 문제가 발생한다:
+> 1. **스타일이 다음 단락으로 밀리는 off-by-one** — 의도한 단락의 바로 뒤 단락에 붙거나 아예 누락됨.
+> 2. **인덱스 재배치** — `build_document` 직후 `get_paragraphs` 결과의 인덱스와, **저장·재로드** 후 인덱스가 1칸씩 달라질 수 있음 (표 주변 빈 paragraph 처리 차이).
+>
+> **권장 패턴**:
+> 1. `build_document` 는 **텍스트 + `align` + `margin_*` + `line_spacing` 정도만** 담아서 골격만 만든다.
+> 2. `save_document` → `open_document` 로 **재로드** 한 뒤 `get_paragraphs` 로 확정된 인덱스를 다시 읽는다.
+> 3. 그 인덱스 기준으로 `set_text_style` (font_size/bold/font_color), `set_hanging_indent` 를 각 단락에 재적용한다.
+>
+> 이 순서를 지키지 않으면 "□ 제목이 본문과 같은 크기로 보인다" 같은 증상이 나타난다.
 
 > **내어쓰기 주의**: DGIST 공문서 양식에서 `□ / ㅇ / - / ㆍ / *` 기호는 단순 공백이 아니라 **음수 firstLineIndent (내어쓰기)** 로 정렬됨 (샘플 실측: 대분류 -27.3 pt, 중분류 -37.44 pt, 소분류 -36.6 pt, 세부 -44.92 pt, 각주 -56.64 pt). `build_document` 만으로는 이 값을 지정할 수 없으므로 **기호 + 앞쪽 공백으로 시각적 정렬** 을 하고, 정확한 내어쓰기가 필요하면 본문 생성 후 `set_hanging_indent` 를 각 단락에 적용.
 
