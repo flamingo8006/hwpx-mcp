@@ -122,6 +122,9 @@ export interface PendingHangingIndent {
   sectionIndex: number;
   elementIndex: number;
   paragraphId: string;
+  /** Zero-based occurrence of paragraphId within the section at call time —
+   *  see PendingParagraphStyle. */
+  paragraphOccurrence?: number;
   indentPt: number;
 }
 
@@ -157,6 +160,13 @@ export interface PendingParagraphInsert {
 export interface PendingParagraphStyle {
   sectionIndex: number;
   elementIndex: number;
+  /** Stable paragraph id captured at call time, used to remap elementIndex
+   *  after copies/moves/inserts shift the section layout during save(). */
+  paragraphId?: string;
+  /** Zero-based occurrence of paragraphId within the section at call time.
+   *  Disambiguates duplicate ids (e.g. after copies) so remap lands on the
+   *  exact paragraph the caller targeted. */
+  paragraphOccurrence?: number;
   style: Partial<ParagraphStyle>;
 }
 
@@ -173,6 +183,11 @@ export interface PendingTableCellCharacterStyle {
 export interface PendingCharacterStyle {
   sectionIndex: number;
   elementIndex: number;
+  /** Stable paragraph id captured at call time — see PendingParagraphStyle. */
+  paragraphId?: string;
+  /** Zero-based occurrence of paragraphId within the section at call time —
+   *  see PendingParagraphStyle. */
+  paragraphOccurrence?: number;
   runIndex: number;
   style: Partial<CharacterStyle>;
 }
@@ -180,6 +195,11 @@ export interface PendingCharacterStyle {
 export interface PendingRunSplit {
   sectionIndex: number;
   elementIndex: number;
+  /** Stable paragraph id captured at call time — see PendingParagraphStyle. */
+  paragraphId?: string;
+  /** Zero-based occurrence of paragraphId within the section at call time —
+   *  see PendingParagraphStyle. */
+  paragraphOccurrence?: number;
   styledRunIndices: Map<number, Partial<CharacterStyle>>;
 }
 
@@ -213,6 +233,14 @@ export interface PendingParagraphCopy {
   sourceParagraph: number;
   targetSection: number;
   targetAfter: number;
+  /**
+   * ID assigned to the newly-cloned in-memory paragraph at call time. Persisted
+   * here so applyParagraphCopiesToXml() can locate the correct in-memory clone
+   * by ID rather than by `targetAfter + 1`, which is not stable when multiple
+   * pending copies share the same `targetAfter` (each successive copy pushes
+   * the previous one one slot further down in section.elements).
+   */
+  cloneId?: string;
 }
 
 export interface PendingParagraphMove {
@@ -231,6 +259,9 @@ export interface PendingNumberingUpdate {
   sectionIndex: number;
   elementIndex: number;
   paragraphId: string;
+  /** Zero-based occurrence of paragraphId within the section at call time —
+   *  see PendingParagraphStyle. */
+  paragraphOccurrence?: number;
   headingType: 'number' | 'bullet';
   numberingId: number;  // reference to numbering or bullet def in header.xml
   level: number;

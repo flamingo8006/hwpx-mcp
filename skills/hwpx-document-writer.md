@@ -21,31 +21,41 @@ description: DGIST 정보전산팀 공문서 형식으로 HWPX 한글 문서를 
 
 ---
 
-## 사용 가능한 템플릿 (`skills/templates/`)
+## 사용 가능한 템플릿
 
-| 파일명 | 트리거 키워드 (in 사용자 요청) | 설명 |
-|--------|-------------------------------|------|
-| `공문서.hwpx` | "공문서", "공문", "DGIST 공문", "공문 서식", "보고서 서식", "기본 서식", "표준 서식" | DGIST 정보전산팀 표준 공문서 (제목 장식 테이블 + 개요 박스 + □/ㅇ/-/ㆍ/* 계층 + 데이터 테이블 + 작성지침) |
+템플릿 파일은 **사용자 로컬 디스크**의 지정 폴더에 저장돼 있다 (Claude 샌드박스가 아니라 로컬 MCP 서버가 접근하는 경로).
 
-**템플릿 경로 확보** — 절대경로는 환경마다 다르므로 **Glob 으로 동적 해결**:
+| 파일명 | 트리거 키워드 (in 사용자 요청) | 설명 | Placeholder 지원 |
+|--------|-------------------------------|------|-----------------|
+| `공문서.hwpx` | "공문서", "공문", "DGIST 공문", "공문 서식", "보고서 서식", "기본 서식", "표준 서식" | DGIST 정보전산팀 표준 공문서 (제목 장식 테이블 + 개요 박스 + □/ㅇ/-/ㆍ/* 계층 4섹션 + 데이터 테이블 + 작성지침) | ✅ (batch_replace 1회로 완성) |
 
-```
-Glob(pattern: "**/skills/templates/공문서.hwpx")
-→ 결과의 첫 번째 경로를 사용
-```
+**템플릿 경로 — OS 별 고정 절대경로 (로컬 MCP 서버가 접근)**
 
-> 새 템플릿 추가 시: `skills/templates/` 에 `.hwpx` 파일을 넣고 이 표에 한 줄 추가.
+| OS | 템플릿 폴더 |
+|----|-----------|
+| **macOS** | `~/Documents/skills/templates/<파일명>` *(`~` 는 `$HOME` 으로 전개되어야 함. 안 되면 `/Users/<username>/Documents/skills/templates/<파일명>`)* |
+| **Windows** | `%USERPROFILE%\Documents\skills\templates\<파일명>` *(예: `C:\Users\<사용자>\Documents\skills\templates\공문서.hwpx`)* |
+
+> **중요**: Skills 는 Anthropic 샌드박스에서 실행되지만 `hwpx-mcp` 도구는 **사용자 로컬 Mac/Windows** 에서 실행된다. 두 파일시스템은 분리돼 있으므로, `cp` 나 `open_document` 에 넘기는 경로는 반드시 **로컬 절대경로** 여야 한다. 스킬 ZIP 내부 `/mnt/skills/.../` 경로는 MCP 가 못 읽는다.
+
+> **경로 해결 순서 (권장)**:
+> 1. 사용자 홈 디렉터리 확인이 필요하면 `Bash` 로 `echo $HOME` (macOS/Linux) 또는 `cmd /c echo %USERPROFILE%` (Windows) 실행.
+> 2. 위 표의 경로 템플릿에 사용자명 치환 후 `open_document({ file_path: ... })` 호출.
+> 3. 파일이 해당 경로에 없으면 **자유 작성 모드로 폴백** (사용자에게 템플릿 부재를 알리고 build_document 진행).
+
+> **새 템플릿 추가 시**: 사용자가 `~/Documents/skills/templates/` 에 `.hwpx` 파일을 넣고 이 표에 한 줄 추가 (스킬 편집).
 
 ---
 
 ## 자유 작성 모드 vs 템플릿 모드 — 핵심 차이
 
-| | 자유 작성 모드 (B) | 템플릿 모드 (A) |
-|--|-------------------|----------------|
+| | 자유 작성 모드 (B) | 템플릿 모드 (A) — placeholder 지원 |
+|--|-------------------|------------------------------------|
 | 시작점 | `create_document` 빈 문서 | 템플릿 복사본 열기 |
-| 본문 생성 | `build_document` 1회 일괄 | placeholder `update_paragraph_text` / `update_table_cell` 반복 |
+| 본문 생성 | `build_document` 1회 일괄 | **`batch_replace` 1회로 placeholder 일괄 치환** |
 | 스타일 정확도 | build_document 범위 내 근사 | **템플릿 서식 100% 보존** |
-| 호출 수 | 6회 (+ 선택적 후처리) | placeholder 개수 + 3회 (open/save/close) |
+| MCP 호출 수 | 6회 (+ 선택적 후처리) | **5회** (Bash cp + open + batch_replace + save + close) |
+| 토큰 사용 | 높음 (build_document JSON 큼) | **매우 낮음** (replacements 배열만) |
 | 권장 상황 | 자유 양식, 빠른 초안 | 공식 문서, 서식 정확도 필수 |
 
 ---
@@ -55,7 +65,7 @@ Glob(pattern: "**/skills/templates/공문서.hwpx")
 **`build_document` 도구를 사용하여 한 번의 호출로 전체 문서를 작성한다.**
 개별 `insert_paragraph` / `set_text_style` 호출 반복 금지 (토큰 낭비).
 
-**기준 서식**: `skills/templates/공문서.hwpx` 를 실측 분석한 결과를 반영.
+**기준 서식**: `~/Documents/skills/templates/공문서.hwpx` 를 실측 분석한 결과를 반영.
 
 ---
 
@@ -267,7 +277,7 @@ save_document({ doc_id, output_path: "/path/to/output.hwpx",
 
 > `create_document` 기본값이 위 설정과 유사. 엄격한 일치가 필요하면 `set_page_settings` 로 명시적 지정.
 >
-> 실제 `skills/templates/공문서.hwpx` 파일 자체는 marginTop/Bottom 이 19.84 pt (≈ 7mm) 로 저장돼 있으나, 문서 내부 표준 작성지침 텍스트(paragraph 26)가 15mm 를 명시하므로 **신규 생성 시 15mm 를 표준**으로 삼는다.
+> 실제 `~/Documents/skills/templates/공문서.hwpx` 파일 자체는 marginTop/Bottom 이 19.84 pt (≈ 7mm) 로 저장돼 있으나, 문서 내부 표준 작성지침 텍스트(paragraph 26)가 15mm 를 명시하므로 **신규 생성 시 15mm 를 표준**으로 삼는다.
 
 ---
 
@@ -332,71 +342,151 @@ save_document({ doc_id, output_path: "/path/to/output.hwpx",
 
 ---
 
-## 템플릿 모드 워크플로
+## 템플릿 모드 워크플로 (placeholder 기반)
 
 사용자가 "**○○ 서식으로**", "**○○ 양식으로**", "**○○ 템플릿으로**" 작성을 요청한 경우.
 
-### 단계
+**핵심 규칙 (반드시 준수)**:
+- Placeholder 지원 템플릿(`공문서.hwpx`)은 **`batch_replace` 1회**로만 모든 치환을 끝낸다.
+- **금지**: `get_paragraphs`, `get_tables`, `get_table_cell`, `find_paragraph_by_text`, `update_paragraph_text`, `update_table_cell` 개별 호출. (호출 수가 5회를 넘어가면 잘못된 것이다.)
+- 사용자가 placeholder 에 대응하는 내용을 명시하지 않은 경우 → 빈 문자열(`""`)로 대체. (섹션이 덜 필요하면 해당 섹션 placeholder 전부 `""`.)
+
+### 공문서.hwpx Placeholder 맵
+
+| Placeholder | 위치 | 설명 | 샘플 값 |
+|-------------|------|------|---------|
+| `{{title}}` | 제목 장식 테이블 | 문서 제목 (HY헤드라인M 20pt) | `정보전산팀 2026년 사업계획` |
+| `{{date}}` | 날짜 단락 (우측) | 문서 일자 | `'26. 4. 21` |
+| `{{dept}}` | 날짜 단락 (우측) | 작성 부서 | `정보전산팀` |
+| `{{summary}}` | 개요 박스 (1×1 표) | 문서 취지 · 요약 (한양중고딕 13pt) | 한두 문장 요약 |
+| `{{s1_heading}}` | 섹션 1 `□` (15pt) | 섹션 1 대분류 제목 | `추진 배경` |
+| `{{s1_point}}` | 섹션 1 `ㅇ` (14pt) | 섹션 1 중분류 | 주요 요지 |
+| `{{s1_detail}}` | 섹션 1 `-` (14pt) | 섹션 1 소분류 | 세부 내용 |
+| `{{s1_sub}}` | 섹션 1 `ㆍ` (13pt) | 섹션 1 세부 | 보충 |
+| `{{s1_note}}` | 섹션 1 `*` (13pt) | 섹션 1 각주 | 출처/주석 |
+| `{{s2_heading}}` ~ `{{s2_note}}` | 섹션 2 (□/ㅇ/-/ㆍ/*) | 위와 동일 패턴 | |
+| `{{s3_heading}}` ~ `{{s3_note}}` | 섹션 3 (□/ㅇ/-/ㆍ/*) | 위와 동일 패턴 | |
+| `{{s4_heading}}` ~ `{{s4_note}}` | 섹션 4 (□/ㅇ/-/ㆍ/*) | 위와 동일 패턴 | |
+| `{{table_title}}` | 데이터 표 제목 | `<…>` 안에 들어갈 표 제목 | `현황 요약` |
+| `{{table_unit}}` | 데이터 표 단위·기준일 | `(…)` 안에 들어갈 부연 | `기준일: 2026.4.21., 단위: 명` |
+| `{{table_note}}` | 데이터 표 주석 | `주:` 뒤의 출처/비고 | `출처: 운영팀 집계` |
+| `{{th1}}` `{{th2}}` `{{th3}}` | 데이터 표 헤더 행 3열 | 12pt bold 가운데 정렬 | `구분` / `항목A` / `항목B` |
+| `{{td1}}` `{{td2}}` `{{td3}}` | 데이터 표 1행 3열 | 12pt 기본 정렬 | 데이터 값 |
+
+> **섹션 수 규칙**
+> - 1~4 개 섹션: 사용하지 않는 `{{sN_*}}` 5개는 전부 `""` 로 치환 (빈 □/ㅇ/-/ㆍ/* 줄이 남는다).
+> - 5 개 이상: 템플릿 한계 초과 → 자유 작성 모드(`build_document`)로 폴백.
+
+### 단계 (총 MCP 호출 5회)
 
 ```
 Step 1. 템플릿 선택 — 위 "사용 가능한 템플릿" 표에서 트리거 키워드 매칭 → 파일명 결정.
+        (공문서.hwpx 말고 placeholder 미지원 사용자 추가 템플릿이면 "폴백 워크플로" 섹션으로 이동.)
 
-Step 2. 템플릿 절대경로 확보 (환경 독립)
-   Glob(pattern: "**/skills/templates/<파일명>")
-   → 첫 번째 결과 = <TEMPLATE_PATH>
+Step 2. 경로 계산
+   - 홈 디렉터리: Bash("echo $HOME") or cmd("echo %USERPROFILE%")
+   - 템플릿 경로 (TEMPLATE_PATH)
+     · macOS:   <HOME>/Documents/skills/templates/공문서.hwpx
+     · Windows: <USERPROFILE>\Documents\skills\templates\공문서.hwpx
+   - 출력 경로 (OUTPUT_PATH)
+     · macOS:   <HOME>/Downloads/<자동생성 파일명>.hwpx
+     · Windows: <USERPROFILE>\Downloads\<자동생성 파일명>.hwpx
+   - 파일이 없으면 자유 작성 모드로 폴백 + 사용자에게 고지.
 
-Step 3. 출력 경로 결정 (사용자 미지정 시)
-   <OUTPUT_PATH> = ~/Downloads/<자동생성 파일명>.hwpx
-   (기본 파일명 규칙은 "저장 경로/파일명 기본 규칙" 섹션 참조)
-
-Step 4. 템플릿 복사 (원본 보존)
+Step 3. 템플릿 복사 (원본 보존)
    Bash: cp "<TEMPLATE_PATH>" "<OUTPUT_PATH>"
 
-Step 5. 복사본 열기
+Step 4. (MCP 1회) 복사본 열기
    open_document({ file_path: "<OUTPUT_PATH>" })
    → { doc_id }
 
-Step 6. 구조 파악 (필수 — placeholder 위치 확인)
-   get_paragraphs({ doc_id }) + get_tables({ doc_id })
-   (또는 find_paragraph_by_text 로 특정 placeholder 검색)
+Step 5. (MCP 1회) 모든 placeholder 일괄 치환 — batch_replace 단 한 번
+   batch_replace({
+     doc_id,
+     replacements: [
+       { old_text: "{{title}}",      new_text: "실제 제목" },
+       { old_text: "{{date}}",       new_text: "'26. 4. 21" },
+       { old_text: "{{dept}}",       new_text: "정보전산팀" },
+       { old_text: "{{summary}}",    new_text: "문서 취지 요약..." },
+       { old_text: "{{s1_heading}}", new_text: "추진 배경" },
+       { old_text: "{{s1_point}}",   new_text: "..." },
+       { old_text: "{{s1_detail}}",  new_text: "..." },
+       { old_text: "{{s1_sub}}",     new_text: "..." },
+       { old_text: "{{s1_note}}",    new_text: "..." },
+       // s2/s3/s4 동일. 안 쓰는 건 new_text: "" 로 둔다.
+       { old_text: "{{s2_heading}}", new_text: "" },
+       { old_text: "{{s2_point}}",   new_text: "" },
+       { old_text: "{{s2_detail}}",  new_text: "" },
+       { old_text: "{{s2_sub}}",     new_text: "" },
+       { old_text: "{{s2_note}}",    new_text: "" },
+       // ... s3, s4 도 같은 방식
+       { old_text: "{{table_title}}", new_text: "현황 요약" },
+       { old_text: "{{table_unit}}",  new_text: "기준일: 2026.4.21., 단위: 명" },
+       { old_text: "{{table_note}}",  new_text: "출처: 운영팀 집계" },
+       { old_text: "{{th1}}",         new_text: "구분" },
+       { old_text: "{{th2}}",         new_text: "항목A" },
+       { old_text: "{{th3}}",         new_text: "항목B" },
+       { old_text: "{{td1}}",         new_text: "1행 1열" },
+       { old_text: "{{td2}}",         new_text: "1행 2열" },
+       { old_text: "{{td3}}",         new_text: "1행 3열" }
+     ]
+   })
 
-Step 7. 내용 치환 (병렬 호출 권장)
-   - 단락 placeholder: update_paragraph_text_preserve_styles 또는 update_paragraph_text
-   - 테이블 셀 placeholder: update_table_cell
-   - 단일 호출에 여러 도구 실행 가능 (한 메시지에 multiple tool_use 블록)
-
-Step 8. 저장 + 정리
+Step 6. (MCP 2회) 저장 + 정리
    save_document({ doc_id, create_backup: false, verify_integrity: true })
    close_document({ doc_id })
 ```
 
 ### 주의
 
-- **템플릿을 build_document 로 재구성하지 말 것.** 템플릿은 이미 완성된 서식이므로, 복사 후 내용만 바꾼다.
-- `update_paragraph_text_preserve_styles` 는 기존 run 의 폰트·크기·색을 보존. 단순 `update_paragraph_text` 는 첫 run 만 유지하고 나머지 run 을 비우므로 스타일 강조가 있던 단락에는 `_preserve_styles` 쪽이 안전.
-- 템플릿에 원래 있던 참고용 섹션 (예: 작성지침, 예시 데이터) 중 **사용자가 바꾸지 않은 부분은 그대로 둠**. 삭제는 명시 요청이 있을 때만.
-- 저장 경로 미지정이어도 되묻지 말고 기본 규칙대로 `~/Downloads/` 에 저장 (자유 작성 모드와 동일).
+- **구조 탐색 금지** — `get_paragraphs` / `get_tables` / `find_*` 호출하지 말 것. Placeholder 맵은 이 문서에 이미 있다.
+- **템플릿을 build_document 로 재구성 금지.**
+- **부분 치환 금지** — 섹션마다 개별 `update_paragraph_text` 호출은 느리고 토큰만 낭비.
+- 저장 경로 미지정이어도 되묻지 말고 기본 규칙대로 `~/Downloads/` 에 저장.
 
-### 예시 — "공문서 서식으로 업무보고 작성해줘"
+### 예시 — "공문서 서식으로 정보전산팀 2026년 사업계획 작성해줘"
 
 ```
-1. Glob("**/skills/templates/공문서.hwpx") → /path/to/skills/templates/공문서.hwpx
-2. cp → ~/Downloads/업무보고_2026-04-21.hwpx
-3. open_document → doc_id
-4. get_paragraphs / get_tables → placeholder 인덱스 파악
-5. (병렬) update_table_cell (제목), update_paragraph_text (날짜/부서),
-          update_table_cell (개요), update_paragraph_text_preserve_styles (□/ㅇ/- 내용) ...
-6. save_document + close_document
+1. Bash("echo $HOME") → /Users/flamingo
+2. cp /Users/flamingo/Documents/skills/templates/공문서.hwpx
+      /Users/flamingo/Downloads/정보전산팀_2026년_사업계획_2026-04-21.hwpx
+3. open_document → { doc_id }
+4. batch_replace(replacements: [ ...위 맵 전체 + 실제 값... ])
+5. save_document + close_document
 ```
+
+총 실행 시간: 10~15초, MCP 호출 5회, 토큰 약 1,500개 수준.
+
+---
+
+## 폴백 워크플로 (사용자 추가 템플릿 — placeholder 미지원)
+
+사용자가 `~/Documents/skills/templates/` 에 직접 추가한 서식(예: 별도 공문 서식) 은 placeholder 가 없을 수 있다. 이 경우 다음 순서로 처리.
+
+```
+Step 1. Bash("echo $HOME") → 홈 경로 확인
+Step 2. 템플릿 복사 (cp)
+Step 3. open_document
+Step 4. get_paragraphs + get_tables — 구조 파악 (2회 병렬)
+Step 5. 치환할 위치가 식별되면:
+   - 여러 update_paragraph_text / update_table_cell 호출을 **단일 메시지에 병렬로** 보낸다 (MCP lock 이 순차 처리).
+   - 스타일이 복잡한 단락은 update_paragraph_text_preserve_styles 사용.
+Step 6. save_document + close_document
+```
+
+> **참고**: 사용자에게 "이 서식도 빠르게 처리하려면 placeholder(`{{key}}`)를 템플릿에 넣어주세요" 라고 안내해도 좋다. Placeholder 가 있는 템플릿은 Step 4~5 가 `batch_replace` 1회로 대체된다.
 
 ---
 
 ## 참고
 
 - **GitHub**: https://github.com/Dayoooun/hwpx-mcp
-- **템플릿 위치**: `skills/templates/` (환경 독립 — Glob 으로 해결)
+- **템플릿 위치**: 사용자 로컬 디스크 고정 경로
+  - macOS: `~/Documents/skills/templates/`
+  - Windows: `%USERPROFILE%\Documents\skills\templates\`
 - **템플릿 출처**: DGIST 정보전산팀 공문서 양식
 - **MCP 도구 수**: 133개 (main 브랜치, 2026-04-20 실측)
 - **핵심 도구**:
   - 자유 작성 모드: `build_document` (일괄 작성) + 선택적 후처리
-  - 템플릿 모드: `open_document` + `update_paragraph_text_preserve_styles` / `update_table_cell` + `save_document`
+  - 템플릿 모드 (placeholder 지원): `open_document` → `batch_replace` 1회 → `save_document` + `close_document`
+  - 폴백 모드 (placeholder 미지원): `open_document` → `get_paragraphs`/`get_tables` → `update_paragraph_text` / `update_table_cell` 병렬 → `save_document` + `close_document`

@@ -144,6 +144,18 @@ export class HwpxDocument {
   private _pendingTableColumnDeletes: PendingTableColumnDelete[] = [];
   private _pendingParagraphCopies: PendingParagraphCopy[] = [];
   private _pendingParagraphMoves: PendingParagraphMove[] = [];
+  /**
+   * Audit trail of every cross-section move performed on this document
+   * before the current save(). Populated eagerly inside moveParagraph(),
+   * consulted by remapPendingOpByParagraphId() so cross-section moves can
+   * target the correct section even when other sections happen to hold
+   * paragraphs with the same id. Cleared at the start of each save().
+   */
+  private _crossSectionMoveAudit: Array<{
+    paragraphId: string;
+    fromSection: number;
+    toSection: number;
+  }> = [];
   private _pendingHeaderUpdates: PendingHeaderFooterUpdate[] = [];
   private _pendingFooterUpdates: PendingHeaderFooterUpdate[] = [];
   private _pendingColumnWidthUpdates: PendingColumnWidthUpdate[] = [];
@@ -451,6 +463,7 @@ export class HwpxDocument {
     this._pendingTableColumnDeletes = [];
     this._pendingParagraphCopies = [];
     this._pendingParagraphMoves = [];
+    this._crossSectionMoveAudit = [];
     this._pendingHeaderUpdates = [];
     this._pendingFooterUpdates = [];
     if (this._pendingTableMoves) this._pendingTableMoves = [];
@@ -714,6 +727,18 @@ export class HwpxDocument {
     const section = this._content.sections[sectionIndex];
     if (!section) return -1;
 
+    // HWPX invariant: the first <hp:p> of every section carries <hp:secPr> and must
+    // remain the first paragraph. applyParagraphInsertsToXml() enforces this on the
+    // XML side by re-mapping afterElementIndex=-1 to "insert after the secPr paragraph".
+    // Mirror that re-mapping on the in-memory side so both layers agree on the new
+    // element's index — otherwise a subsequent copy_paragraph/update_paragraph_text
+    // would resolve to different paragraphs in memory vs. XML and silently corrupt
+    // the document. (2026-04-22 regression: the test suite catches this.)
+    const resolvedAfterIndex =
+      afterElementIndex === -1 && section.elements[0]?.type === 'paragraph'
+        ? 0
+        : afterElementIndex;
+
     this.saveState();
     const paragraphId = Math.random().toString(36).substring(2, 11);
     const newParagraph: HwpxParagraph = {
@@ -722,12 +747,12 @@ export class HwpxDocument {
     };
 
     const newElement: SectionElement = { type: 'paragraph', data: newParagraph };
-    section.elements.splice(afterElementIndex + 1, 0, newElement);
+    section.elements.splice(resolvedAfterIndex + 1, 0, newElement);
 
     // Add to pending list for XML sync
     this._pendingParagraphInserts.push({
       sectionIndex,
-      afterElementIndex,
+      afterElementIndex: resolvedAfterIndex,
       paragraphId,
       text,
       bold: charStyle?.bold,
@@ -739,7 +764,7 @@ export class HwpxDocument {
 
     this.markModified();
     this.invalidateReadingCache();
-    return afterElementIndex + 1;
+    return resolvedAfterIndex + 1;
   }
 
   /**
@@ -858,10 +883,16 @@ export class HwpxDocument {
     const run = paragraph.runs[runIndex];
     run.charStyle = { ...run.charStyle, ...style };
 
-    // Add to pending list for XML sync
+    // Add to pending list for XML sync.
+    // Codex-review (2026-04-22): record the paragraph id so that
+    // remapPendingByParagraphId() can recover the correct elementIndex if
+    // copy/move/insert ops run earlier in the save pipeline and shift the
+    // section layout before applyCharacterStylesToXml() runs.
     this._pendingCharacterStyles.push({
       sectionIndex,
       elementIndex,
+      paragraphId: paragraph.id,
+      paragraphOccurrence: this.getParagraphOccurrence(sectionIndex, elementIndex, paragraph.id || ''),
       runIndex,
       style,
     });
@@ -998,6 +1029,9 @@ export class HwpxDocument {
       this._pendingRunSplits.push({
         sectionIndex,
         elementIndex,
+        // Codex-review (2026-04-22): see PendingCharacterStyle rationale.
+        paragraphId: paragraph.id,
+        paragraphOccurrence: this.getParagraphOccurrence(sectionIndex, elementIndex, paragraph.id || ''),
         styledRunIndices: styledNewRunIndices,
       });
     }
@@ -1027,10 +1061,13 @@ export class HwpxDocument {
     this.saveState();
     paragraph.paraStyle = { ...paragraph.paraStyle, ...style };
 
-    // Add to pending list for XML sync
+    // Add to pending list for XML sync.
+    // Codex-review (2026-04-22): see PendingCharacterStyle rationale.
     this._pendingParagraphStyles.push({
       sectionIndex,
       elementIndex,
+      paragraphId: paragraph.id,
+      paragraphOccurrence: this.getParagraphOccurrence(sectionIndex, elementIndex, paragraph.id || ''),
       style,
     });
 
@@ -1085,6 +1122,7 @@ export class HwpxDocument {
         sectionIndex,
         elementIndex,
         paragraphId: paragraph.id,
+        paragraphOccurrence: this.getParagraphOccurrence(sectionIndex, elementIndex, paragraph.id || ''),
         indentPt,
       });
     }
@@ -1148,6 +1186,7 @@ export class HwpxDocument {
         sectionIndex,
         elementIndex,
         paragraphId: paragraph.id,
+        paragraphOccurrence: this.getParagraphOccurrence(sectionIndex, elementIndex, paragraph.id || ''),
         indentPt: 0,  // 0 means remove
       });
     }
@@ -2823,6 +2862,7 @@ export class HwpxDocument {
       sectionIndex,
       elementIndex,
       paragraphId: paragraph.id,
+      paragraphOccurrence: this.getParagraphOccurrence(sectionIndex, elementIndex, paragraph.id || ''),
       headingType,
       numberingId: defId,
       level,
@@ -3437,19 +3477,161 @@ export class HwpxDocument {
     if (!srcElement || srcElement.type !== 'paragraph') return false;
 
     this.saveState();
+
+    // Codex 5th-pass P2 (2026-04-22): compute the source paragraph's
+    // occurrence BEFORE splicing the clone in, so we can disambiguate between
+    // multiple paragraphs that share the same id. The clone is assigned a
+    // freshly minted id, so it never collides with existing occurrences.
+    const srcData = srcElement.data as HwpxParagraph;
+    const srcId = srcData?.id;
+    const srcOccurrence = srcId
+      ? this.getParagraphOccurrence(sourceSection, sourceParagraph, srcId)
+      : undefined;
+
     const copy = JSON.parse(JSON.stringify(srcElement));
-    copy.data.id = Math.random().toString(36).substring(2, 11);
-    tgtSection.elements.splice(targetAfter + 1, 0, copy);
+    const cloneId = Math.random().toString(36).substring(2, 11);
+    copy.data.id = cloneId;
+    const cloneElementIndex = targetAfter + 1;
+    tgtSection.elements.splice(cloneElementIndex, 0, copy);
 
     this._pendingParagraphCopies.push({
       sourceSection,
       sourceParagraph,
       targetSection,
       targetAfter,
+      cloneId,
     });
+
+    // Codex 3rd-pass P1 (2026-04-22): "style src → copy src → save" previously
+    // produced an unstyled copy because the reordered save pipeline runs
+    // applyParagraphCopiesToXml() before applyParagraphStylesToXml() &
+    // friends, and the cloned XML is a raw pre-style snapshot of the source.
+    // Duplicate any pending style-like ops that currently target the source
+    // paragraph so they also land on the clone's XML. The in-memory
+    // paragraph.paraStyle was already deep-copied by JSON.parse(), so the
+    // duplicates are purely to keep the XML in sync.
+    if (srcId) {
+      this.duplicatePendingStylesForClone(
+        sourceSection,
+        sourceParagraph,
+        srcId,
+        srcOccurrence ?? 0,
+        targetSection,
+        cloneElementIndex,
+        cloneId,
+      );
+    }
 
     this.markModified();
     return true;
+  }
+
+  /**
+   * Codex 3rd-pass P1 follow-up: when a paragraph is cloned via copyParagraph,
+   * any pending style/runSplit/hangingIndent/numbering ops that currently
+   * target the source must also be queued for the clone so the cloned XML
+   * receives the same formatting at save time.
+   *
+   * Matches on `(sectionIndex, paragraphId, paragraphOccurrence)` — using
+   * occurrence (Codex 5th-pass P2) keeps the propagation precise even when
+   * the section already contains other paragraphs sharing the same id. For
+   * legacy ops lacking a paragraphId, we fall back to matching on
+   * elementIndex so we still propagate, but we never silently propagate
+   * ops for paragraphs that share the id but sit at a different occurrence.
+   */
+  private duplicatePendingStylesForClone(
+    sourceSection: number,
+    sourceElementIndex: number,
+    sourceParagraphId: string,
+    sourceOccurrence: number,
+    cloneSection: number,
+    cloneElementIndex: number,
+    cloneParagraphId: string,
+  ): void {
+    const matches = (op: { sectionIndex: number; paragraphId?: string; paragraphOccurrence?: number; elementIndex?: number }): boolean => {
+      if (op.sectionIndex !== sourceSection) return false;
+      if (op.paragraphId) {
+        if (op.paragraphId !== sourceParagraphId) return false;
+        // Disambiguate duplicate-id siblings: only the op that targeted the
+        // very paragraph being cloned should propagate.
+        return (op.paragraphOccurrence ?? 0) === sourceOccurrence;
+      }
+      return op.elementIndex === sourceElementIndex;
+    };
+
+    // cloneId is freshly minted and unique within the section, so the clone's
+    // first (and only) occurrence in the id-map is 0.
+    const cloneOccurrence = 0;
+
+    // Snapshot each array first — we're about to push into them.
+    const paragraphStylesSnap = this._pendingParagraphStyles.slice();
+    for (const op of paragraphStylesSnap) {
+      if (!matches(op)) continue;
+      this._pendingParagraphStyles.push({
+        sectionIndex: cloneSection,
+        elementIndex: cloneElementIndex,
+        paragraphId: cloneParagraphId,
+        paragraphOccurrence: cloneOccurrence,
+        style: { ...op.style },
+      });
+    }
+
+    const characterStylesSnap = this._pendingCharacterStyles.slice();
+    for (const op of characterStylesSnap) {
+      if (!matches(op)) continue;
+      this._pendingCharacterStyles.push({
+        sectionIndex: cloneSection,
+        elementIndex: cloneElementIndex,
+        paragraphId: cloneParagraphId,
+        paragraphOccurrence: cloneOccurrence,
+        runIndex: op.runIndex,
+        style: { ...op.style },
+      });
+    }
+
+    const runSplitsSnap = this._pendingRunSplits.slice();
+    for (const op of runSplitsSnap) {
+      if (!matches(op)) continue;
+      // Deep-clone the Map of styled run indices — callers may keep a
+      // reference to the originating Map.
+      const clonedIndices = new Map<number, Partial<CharacterStyle>>();
+      for (const [idx, style] of op.styledRunIndices) {
+        clonedIndices.set(idx, { ...style });
+      }
+      this._pendingRunSplits.push({
+        sectionIndex: cloneSection,
+        elementIndex: cloneElementIndex,
+        paragraphId: cloneParagraphId,
+        paragraphOccurrence: cloneOccurrence,
+        styledRunIndices: clonedIndices,
+      });
+    }
+
+    const hangingSnap = this._pendingHangingIndents.slice();
+    for (const op of hangingSnap) {
+      if (!matches(op)) continue;
+      this._pendingHangingIndents.push({
+        sectionIndex: cloneSection,
+        elementIndex: cloneElementIndex,
+        paragraphId: cloneParagraphId,
+        paragraphOccurrence: cloneOccurrence,
+        indentPt: op.indentPt,
+      });
+    }
+
+    const numberingSnap = this._pendingNumberingUpdates.slice();
+    for (const op of numberingSnap) {
+      if (!matches(op)) continue;
+      this._pendingNumberingUpdates.push({
+        sectionIndex: cloneSection,
+        elementIndex: cloneElementIndex,
+        paragraphId: cloneParagraphId,
+        paragraphOccurrence: cloneOccurrence,
+        headingType: op.headingType,
+        numberingId: op.numberingId,
+        level: op.level,
+      });
+    }
   }
 
   moveParagraph(sourceSection: number, sourceParagraph: number, targetSection: number, targetAfter: number): boolean {
@@ -3461,6 +3643,20 @@ export class HwpxDocument {
     if (!srcElement || srcElement.type !== 'paragraph') return false;
 
     this.saveState();
+
+    // Codex 5th-pass P2 (2026-04-22): capture the moved paragraph's id and
+    // occurrence BEFORE the splice so we can eagerly retarget any pending
+    // text/style/etc ops that referred to it. Without this, a cross-section
+    // move where the source section still retains another paragraph with the
+    // same id would leave pending ops pointing to the sibling (because
+    // resolveIn(sourceSection) still succeeds).
+    const movedId = srcElement.type === 'paragraph'
+      ? (srcElement.data as HwpxParagraph).id
+      : undefined;
+    const srcOccurrence = movedId
+      ? this.getParagraphOccurrence(sourceSection, sourceParagraph, movedId)
+      : undefined;
+
     srcSection.elements.splice(sourceParagraph, 1);
 
     // Fix same-section index shift: if source was before target, adjust target down
@@ -3469,7 +3665,8 @@ export class HwpxDocument {
       adjustedTargetAfter -= 1;
     }
 
-    tgtSection.elements.splice(adjustedTargetAfter + 1, 0, srcElement);
+    const insertedIndex = adjustedTargetAfter + 1;
+    tgtSection.elements.splice(insertedIndex, 0, srcElement);
 
     this._pendingParagraphMoves.push({
       sourceSection,
@@ -3478,8 +3675,109 @@ export class HwpxDocument {
       targetAfter,
     });
 
+    // Recompute the moved paragraph's occurrence in the destination section
+    // AFTER the insert. Eagerly rewrite pending ops that pointed at it, and
+    // shift the occurrences of its duplicate-id siblings in the source /
+    // target sections so occurrence-based remap stays consistent.
+    if (movedId && srcOccurrence !== undefined) {
+      const tgtOccurrence = this.getParagraphOccurrence(targetSection, insertedIndex, movedId);
+      this.adjustPendingOpsForParagraphMove(
+        movedId,
+        sourceSection,
+        srcOccurrence,
+        targetSection,
+        insertedIndex,
+        tgtOccurrence,
+      );
+
+      // Codex P2 (2026-04-22): also record the cross-section destination so
+      // that the last-resort path in remapPendingOpByParagraphId() can route
+      // any legacy ops without an occurrence to the right section.
+      if (sourceSection !== targetSection) {
+        this._crossSectionMoveAudit.push({
+          paragraphId: movedId,
+          fromSection: sourceSection,
+          toSection: targetSection,
+        });
+      }
+    }
+
     this.markModified();
     return true;
+  }
+
+  /**
+   * Codex 5th-pass P2 (2026-04-22): eagerly rewrite every pending op that
+   * targeted a paragraph which just moved, and fix up the recorded
+   * occurrences of its duplicate-id siblings so subsequent save-time remaps
+   * land on the intended paragraph.
+   */
+  private adjustPendingOpsForParagraphMove(
+    movedId: string,
+    sourceSection: number,
+    srcOccurrence: number,
+    targetSection: number,
+    targetElementIndex: number,
+    targetOccurrence: number,
+  ): void {
+    type Op = {
+      sectionIndex: number;
+      elementIndex: number;
+      paragraphId?: string;
+      paragraphOccurrence?: number;
+    };
+    const adjust = (op: Op) => {
+      if (!op.paragraphId || op.paragraphId !== movedId) return;
+      const occ = op.paragraphOccurrence ?? 0;
+
+      if (sourceSection === targetSection) {
+        // Same-section reordering: the moved paragraph's occurrence changes
+        // from srcOccurrence to targetOccurrence; siblings between them
+        // shift by one toward the old slot.
+        if (op.sectionIndex !== sourceSection) return;
+        if (occ === srcOccurrence) {
+          op.paragraphOccurrence = targetOccurrence;
+          op.elementIndex = targetElementIndex;
+          return;
+        }
+        if (srcOccurrence < targetOccurrence) {
+          // Moved forward. Siblings in (srcOccurrence, targetOccurrence] shift −1.
+          if (occ > srcOccurrence && occ <= targetOccurrence) {
+            op.paragraphOccurrence = occ - 1;
+          }
+        } else if (srcOccurrence > targetOccurrence) {
+          // Moved backward. Siblings in [targetOccurrence, srcOccurrence) shift +1.
+          if (occ >= targetOccurrence && occ < srcOccurrence) {
+            op.paragraphOccurrence = occ + 1;
+          }
+        }
+        return;
+      }
+
+      // Cross-section move.
+      if (op.sectionIndex === sourceSection) {
+        if (occ === srcOccurrence) {
+          op.sectionIndex = targetSection;
+          op.elementIndex = targetElementIndex;
+          op.paragraphOccurrence = targetOccurrence;
+        } else if (occ > srcOccurrence) {
+          // Siblings with higher occurrence shift down by one.
+          op.paragraphOccurrence = occ - 1;
+        }
+      } else if (op.sectionIndex === targetSection) {
+        if (occ >= targetOccurrence) {
+          // Siblings at or after the insertion point shift up by one.
+          op.paragraphOccurrence = occ + 1;
+        }
+      }
+    };
+
+    for (const op of this._pendingDirectTextUpdates) adjust(op);
+    for (const op of this._pendingParagraphStyles) adjust(op);
+    for (const op of this._pendingCharacterStyles) adjust(op);
+    for (const op of this._pendingRunSplits) adjust(op);
+    for (const op of this._pendingHangingIndents) adjust(op);
+    for (const op of this._pendingNumberingUpdates) adjust(op);
   }
 
   // ============================================================
@@ -4961,11 +5259,18 @@ export class HwpxDocument {
       this._zip.file('mimetype', mimetypeContent, { compression: 'STORE' });
     }
 
-    return await this._zip.generateAsync({
+    const buffer = await this._zip.generateAsync({
       type: 'nodebuffer',
       compression: 'DEFLATE',
       compressionOptions: { level: 6 }
     });
+
+    // Reset the cross-section move audit now that the save is complete.
+    // Subsequent edits start from a clean slate so old move records don't
+    // bleed into the next save's remap decisions.
+    this._crossSectionMoveAudit = [];
+
+    return buffer;
   }
 
   // WARNING: syncContentToZip reads and writes header.xml and section XML files sequentially.
@@ -5006,8 +5311,42 @@ export class HwpxDocument {
       this._pendingParagraphInserts = [];
     }
 
+    // Apply paragraph copies
+    //
+    // BUGFIX (2026-04-22): Must run BEFORE applyDirectTextUpdatesToXml.
+    //
+    // Previously copies/moves ran at the end of save(). If a user copied a
+    // paragraph and then called updateParagraphText on the new copy, the
+    // text-update pass (which resolves elementIndex → XML paragraph position
+    // by counting top-level paragraphs in the existing XML) could not yet
+    // see the copied paragraph because it had not been inserted into XML.
+    // That made the update land on the wrong sibling or get swallowed, and
+    // the later copy pass then cloned the polluted source XML — producing
+    // templates with concatenated or aliased placeholder text.
+    //
+    // Running copies/moves alongside other structural ops (inserts, deletes)
+    // ensures every subsequent elementIndex lookup sees an XML layout that
+    // matches the in-memory model.
+    if (this._pendingParagraphCopies && this._pendingParagraphCopies.length > 0) {
+      await this.applyParagraphCopiesToXml();
+      this._pendingParagraphCopies = [];
+    }
+
+    // Apply paragraph moves (see note on copies above — same ordering constraint)
+    if (this._pendingParagraphMoves && this._pendingParagraphMoves.length > 0) {
+      await this.applyParagraphMovesToXml();
+      this._pendingParagraphMoves = [];
+    }
+
     // Apply numbering updates
+    //
+    // Codex 4th-pass P2 (2026-04-22): paragraphCopies/Moves above may have
+    // shifted the elementIndex of any paragraph whose numbering was queued
+    // earlier. Remap via paragraphId first so the heading/bullet style lands
+    // on the intended paragraph rather than whichever paragraph now occupies
+    // the stale slot.
     if (this._pendingNumberingUpdates && this._pendingNumberingUpdates.length > 0) {
+      this.remapPendingNumberingUpdateIndices();
       await this.applyNumberingUpdatesToXml();
       this._pendingNumberingUpdates = [];
     }
@@ -5055,7 +5394,25 @@ export class HwpxDocument {
     }
 
     // Apply direct text updates (from updateParagraphText)
+    //
+    // BUGFIX (2026-04-22): Invalidate cached XML byte offsets before applying text
+    // updates. All structural ops above (inserts, deletes, copies, moves, cell
+    // merges/splits, etc.) mutate the XML and shift subsequent paragraphs; any
+    // `_xmlPosition` populated at parse time is now potentially stale. Left intact,
+    // `getCachedXmlPosition()` would return offsets whose slice still happens to
+    // start with `<hp:p>` — passing the weak validation check — but point to the
+    // wrong paragraph, silently routing updates onto the source/preceding paragraph.
+    // This is what corrupted the 공문서.hwpx template even after the save-pipeline
+    // reorder: copied paragraphs inherited the source's cached position via the
+    // deep clone in copyParagraph(). Forcing a fallback to elementIndex-based
+    // lookup here keeps updates aligned with the current in-memory model.
     if (this._pendingDirectTextUpdates && this._pendingDirectTextUpdates.length > 0) {
+      this.invalidateXmlPositions();
+      // BUGFIX (2026-04-22): After moveParagraph/insertParagraph/copyParagraph/etc.
+      // run above, the in-memory element indices of paragraphs shift. Pending
+      // text-update records captured a stale elementIndex at call time. Remap them
+      // by paragraphId to the current in-memory position before applying to XML.
+      this.remapPendingDirectTextUpdateIndices();
       await this.applyDirectTextUpdatesToXml();
       this._pendingDirectTextUpdates = [];
     }
@@ -5079,7 +5436,11 @@ export class HwpxDocument {
     }
 
     // Apply hanging indent changes
+    //
+    // Codex 4th-pass P2 (2026-04-22): same rationale as numbering updates above
+    // — remap by paragraphId to survive structural ops that ran earlier.
     if (this._pendingHangingIndents && this._pendingHangingIndents.length > 0) {
+      this.remapPendingHangingIndentIndices();
       await this.applyHangingIndentsToXml();
       this._pendingHangingIndents = [];
     }
@@ -5091,19 +5452,29 @@ export class HwpxDocument {
     }
 
     // Apply paragraph style changes (alignment, etc.)
+    //
+    // Codex-review (2026-04-22): the copy/move passes above may have shifted
+    // elementIndex for paragraphs whose style was set before those structural
+    // ops were requested. Remap via paragraphId so the style lands on the
+    // intended paragraph rather than on whichever paragraph now occupies the
+    // old index. Same rationale applies to the runSplit and character-style
+    // passes below.
     if (this._pendingParagraphStyles && this._pendingParagraphStyles.length > 0) {
+      this.remapPendingParagraphStyleIndices();
       await this.applyParagraphStylesToXml();
       this._pendingParagraphStyles = [];
     }
 
     // Apply run splits (must happen before character style changes)
     if (this._pendingRunSplits && this._pendingRunSplits.length > 0) {
+      this.remapPendingRunSplitIndices();
       await this.applyRunSplitsToXml();
       this._pendingRunSplits = [];
     }
 
     // Apply character style changes (font, size, etc.)
     if (this._pendingCharacterStyles && this._pendingCharacterStyles.length > 0) {
+      this.remapPendingCharacterStyleIndices();
       await this.applyCharacterStylesToXml();
       this._pendingCharacterStyles = [];
     }
@@ -5138,17 +5509,7 @@ export class HwpxDocument {
       this._pendingTableColumnDeletes = [];
     }
 
-    // Apply paragraph copies
-    if (this._pendingParagraphCopies && this._pendingParagraphCopies.length > 0) {
-      await this.applyParagraphCopiesToXml();
-      this._pendingParagraphCopies = [];
-    }
-
-    // Apply paragraph moves
-    if (this._pendingParagraphMoves && this._pendingParagraphMoves.length > 0) {
-      await this.applyParagraphMovesToXml();
-      this._pendingParagraphMoves = [];
-    }
+    // (paragraph copies and moves are applied earlier — see note above applyParagraphInsertsToXml block)
 
     // Apply header/footer updates
     if (this._pendingHeaderUpdates && this._pendingHeaderUpdates.length > 0 ||
@@ -5202,6 +5563,227 @@ export class HwpxDocument {
           delete para._xmlPosition;
         }
       }
+    }
+  }
+
+  /**
+   * Remap each pending direct-text-update's `elementIndex` to the target
+   * paragraph's current in-memory position, identified by `paragraphId`.
+   *
+   * `updateParagraphText()` captures `elementIndex` at call time and pushes
+   * it into `_pendingDirectTextUpdates`. Structural operations performed
+   * afterwards (moveParagraph, neighbor insertParagraph/deleteParagraph,
+   * paragraph copies that shift later indices, etc.) may relocate the
+   * target paragraph without touching the pending entry. At save time,
+   * findTargetParagraphForUpdate's TIER 2 lookup counts top-level
+   * paragraphs in `_content.sections[i].elements` up to `elementIndex`,
+   * so a stale index routes the update onto whichever sibling now sits
+   * at that slot — silently corrupting neighbor paragraphs.
+   *
+   * This rewrites each pending update's `elementIndex` to wherever its
+   * `paragraphId` currently lives in memory, keeping TIER 2 aligned with
+   * the post-structural-op layout that the XML already reflects (because
+   * inserts, copies, and moves have all been applied by the time this
+   * runs — see the save pipeline in `syncContentToZip`).
+   *
+   * Entries whose `paragraphId` no longer resolves (e.g., the target was
+   * deleted) are left untouched so the existing fuzzy-match fallbacks in
+   * findTargetParagraphForUpdate can still try.
+   */
+  /**
+   * Build per-section maps of `paragraphId → ordered list of elementIndex`
+   * for the current in-memory section layout. HWPX documents in the wild can
+   * contain duplicate paragraph ids (especially when templates are reused);
+   * the ordered list preserves every occurrence so callers can discriminate
+   * with a `paragraphOccurrence` index.
+   */
+  private buildSectionParagraphIdMaps(): Map<number, Map<string, number[]>> {
+    const sectionIdMaps = new Map<number, Map<string, number[]>>();
+    if (!this._content?.sections) return sectionIdMaps;
+    for (let si = 0; si < this._content.sections.length; si++) {
+      const section = this._content.sections[si];
+      if (!section) continue;
+      const map = new Map<string, number[]>();
+      for (let i = 0; i < section.elements.length; i++) {
+        const el = section.elements[i];
+        if (el.type !== 'paragraph') continue;
+        const id = (el.data as import('./types').HwpxParagraph).id;
+        if (!id) continue;
+        const list = map.get(id);
+        if (list) {
+          list.push(i);
+        } else {
+          map.set(id, [i]);
+        }
+      }
+      sectionIdMaps.set(si, map);
+    }
+    return sectionIdMaps;
+  }
+
+  /**
+   * Remap a pending op's `(sectionIndex, elementIndex)` by paragraph id.
+   *
+   * Returns `true` when the op was rewritten to a newly discovered position,
+   * `false` when the current position is still correct or no id was recorded.
+   *
+   * Handles two regressions that appear because structural ops (inserts,
+   * copies, moves) now run earlier in the save pipeline than this one:
+   *   1. Same-section shift — copies/moves/inserts moved the paragraph inside
+   *      the same section, so its elementIndex changed.
+   *   2. Cross-section move — the paragraph was moved to a different section;
+   *      we fall back to consulting the move audit (populated eagerly by
+   *      `moveParagraph()`) before scanning other sections, so we don't
+   *      mis-attach to an unrelated duplicate id in a sibling section.
+   */
+  private remapPendingOpByParagraphId(
+    op: { sectionIndex: number; elementIndex: number; paragraphId?: string; paragraphOccurrence?: number },
+    sectionIdMaps: Map<number, Map<string, number[]>>,
+  ): boolean {
+    if (!op.paragraphId) return false;
+    const occurrence = op.paragraphOccurrence ?? 0;
+
+    const resolveIn = (si: number): number | undefined => {
+      const idMap = sectionIdMaps.get(si);
+      if (!idMap) return undefined;
+      const indices = idMap.get(op.paragraphId as string);
+      if (!indices || indices.length === 0) return undefined;
+      if (occurrence < 0 || occurrence >= indices.length) return undefined;
+      return indices[occurrence];
+    };
+
+    // Try the recorded section first — the common case.
+    const currentIndex = resolveIn(op.sectionIndex);
+    if (currentIndex !== undefined) {
+      if (currentIndex !== op.elementIndex) {
+        op.elementIndex = currentIndex;
+        return true;
+      }
+      return false;
+    }
+
+    // Codex P2 (2026-04-22): cross-section move fallback. Consult the move
+    // audit first — `moveParagraph()` records exactly where it sent each
+    // paragraph, so we can target the right section even when multiple
+    // sections happen to hold paragraphs with the same id. Only fall back to
+    // "first section containing this id" if the audit has nothing, and even
+    // then prefer an occurrence-match to keep the semantics narrow.
+    const auditedSection = this.findAuditedMoveTargetSection(op.paragraphId, op.sectionIndex);
+    if (auditedSection !== undefined) {
+      const idx = resolveIn(auditedSection);
+      if (idx !== undefined) {
+        op.sectionIndex = auditedSection;
+        op.elementIndex = idx;
+        return true;
+      }
+    }
+
+    // Last-resort scan. Without an audit record we cannot be 100% sure the
+    // matching id refers to the same paragraph as the one originally targeted,
+    // so we only accept a match when the target section contains exactly one
+    // paragraph with this id — duplicate-id ambiguity is left for the fuzzy
+    // text-match in findTargetParagraphForUpdate() to handle (or for the
+    // silent no-op path, which is safer than writing to the wrong paragraph).
+    if (!this._content?.sections) return false;
+    const candidateSections: number[] = [];
+    for (let si = 0; si < this._content.sections.length; si++) {
+      if (si === op.sectionIndex) continue;
+      const idMap = sectionIdMaps.get(si);
+      if (!idMap) continue;
+      const indices = idMap.get(op.paragraphId);
+      if (indices && indices.length > 0) {
+        candidateSections.push(si);
+      }
+    }
+    if (candidateSections.length === 1) {
+      const idx = resolveIn(candidateSections[0]);
+      if (idx !== undefined) {
+        op.sectionIndex = candidateSections[0];
+        op.elementIndex = idx;
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Consult the cross-section move audit for the target section of a move.
+   * Returns the most-recent recorded target section, or undefined if none.
+   *
+   * We walk the audit in reverse so the last-recorded move wins when a
+   * paragraph was moved multiple times before save.
+   */
+  private findAuditedMoveTargetSection(paragraphId: string, origin: number): number | undefined {
+    const audit = this._crossSectionMoveAudit;
+    if (!audit || audit.length === 0) return undefined;
+    for (let i = audit.length - 1; i >= 0; i--) {
+      const entry = audit[i];
+      if (entry.paragraphId === paragraphId && entry.fromSection === origin) {
+        return entry.toSection;
+      }
+    }
+    return undefined;
+  }
+
+  private remapPendingDirectTextUpdateIndices(): void {
+    if (!this._pendingDirectTextUpdates || this._pendingDirectTextUpdates.length === 0) return;
+    const sectionIdMaps = this.buildSectionParagraphIdMaps();
+    for (const update of this._pendingDirectTextUpdates) {
+      this.remapPendingOpByParagraphId(update, sectionIdMaps);
+    }
+  }
+
+  /**
+   * Codex-review (2026-04-22): copies/moves now run earlier in save() than
+   * the style/runSplit passes below, so their `elementIndex` can be stale by
+   * the time XML is written. Remap by paragraphId before each pass.
+   */
+  private remapPendingParagraphStyleIndices(): void {
+    if (!this._pendingParagraphStyles || this._pendingParagraphStyles.length === 0) return;
+    const sectionIdMaps = this.buildSectionParagraphIdMaps();
+    for (const op of this._pendingParagraphStyles) {
+      this.remapPendingOpByParagraphId(op, sectionIdMaps);
+    }
+  }
+
+  private remapPendingCharacterStyleIndices(): void {
+    if (!this._pendingCharacterStyles || this._pendingCharacterStyles.length === 0) return;
+    const sectionIdMaps = this.buildSectionParagraphIdMaps();
+    for (const op of this._pendingCharacterStyles) {
+      this.remapPendingOpByParagraphId(op, sectionIdMaps);
+    }
+  }
+
+  private remapPendingRunSplitIndices(): void {
+    if (!this._pendingRunSplits || this._pendingRunSplits.length === 0) return;
+    const sectionIdMaps = this.buildSectionParagraphIdMaps();
+    for (const op of this._pendingRunSplits) {
+      this.remapPendingOpByParagraphId(op, sectionIdMaps);
+    }
+  }
+
+  /**
+   * Codex 4th-pass P2 (2026-04-22): numbering updates are now flushed AFTER
+   * paragraphCopies/Moves in the save pipeline (and `duplicatePendingStylesForClone()`
+   * can also inject clone-target numbering entries), so their recorded
+   * `elementIndex` can be stale. Remap by paragraphId before writing.
+   */
+  private remapPendingNumberingUpdateIndices(): void {
+    if (!this._pendingNumberingUpdates || this._pendingNumberingUpdates.length === 0) return;
+    const sectionIdMaps = this.buildSectionParagraphIdMaps();
+    for (const op of this._pendingNumberingUpdates) {
+      this.remapPendingOpByParagraphId(op, sectionIdMaps);
+    }
+  }
+
+  /**
+   * Hanging-indent passes run late in the pipeline too — same remap pattern.
+   */
+  private remapPendingHangingIndentIndices(): void {
+    if (!this._pendingHangingIndents || this._pendingHangingIndents.length === 0) return;
+    const sectionIdMaps = this.buildSectionParagraphIdMaps();
+    for (const op of this._pendingHangingIndents) {
+      this.remapPendingOpByParagraphId(op, sectionIdMaps);
     }
   }
 
@@ -9101,6 +9683,37 @@ export class HwpxDocument {
       const hasMatchingText = nonEmptyOldTexts.some(escapedOld => indexBasedTarget.xml.includes(escapedOld));
       if (hasMatchingText) {
         return indexBasedTarget;
+      }
+      // BUGFIX (2026-04-22): Idempotent-update acceptance.
+      // When applyParagraphCopiesToXml() calls overlayInMemoryRunTextsOntoParagraphXml(),
+      // the cloned paragraph is pre-populated with the updated in-memory text. At that
+      // point the oldText no longer exists in the target XML (it was replaced by newText),
+      // so the check above fails. Without this acceptance branch we fall through to the
+      // "nearby ±2" fallback which wrongly reroutes the update onto the source paragraph
+      // (which still contains oldText).
+      //
+      // Codex P2 (2026-04-22): Only accept when we can POSITIVELY identify the
+      // target as the intended paragraph — i.e., its XML carries the same id
+      // we were asked to address. Without the id gate the branch would also
+      // accept any stale index-based candidate that happens to share a placeholder
+      // with a sibling (repeated headings, repeated table labels, …) and silently
+      // skip updating the real target.
+      if (paragraphId) {
+        const escapedId = paragraphId.replace(/"/g, '&quot;');
+        const targetHasId = indexBasedTarget.xml.includes(`id="${escapedId}"`);
+        if (targetHasId) {
+          const nonEmptyNewTexts = updates
+            .filter(u => u.newText !== '')
+            .map(u => this.escapeXml(u.newText));
+          if (nonEmptyNewTexts.length > 0) {
+            const hasMatchingNewText = nonEmptyNewTexts.some(
+              escapedNew => indexBasedTarget.xml.includes(escapedNew)
+            );
+            if (hasMatchingNewText) {
+              return indexBasedTarget;
+            }
+          }
+        }
       }
     }
 
@@ -14272,6 +14885,127 @@ export class HwpxDocument {
     return results;
   }
 
+  /**
+   * Overlay the text of each in-memory run onto the matching text-bearing
+   * `<hp:run>` element inside a standalone paragraph XML snippet.
+   *
+   * Used by applyParagraphCopiesToXml to ensure a cloned paragraph carries
+   * the latest in-memory text (which may reflect updates the caller made
+   * before the copy). Preserves all run styling — only the `<hp:t>` content
+   * is replaced. Runs that do not carry `<hp:t>` (e.g., ctrl-only runs) are
+   * skipped so in-memory run indices stay aligned with the HwpxParser's
+   * view of "text-bearing runs".
+   */
+  private overlayInMemoryRunTextsOntoParagraphXml(
+    paragraphXml: string,
+    paragraph: HwpxParagraph
+  ): string {
+    const runs = paragraph.runs || [];
+    if (runs.length === 0) return paragraphXml;
+
+    // Locate every <hp:run>...</hp:run> range (balanced) in the paragraph.
+    const runRanges: { start: number; end: number; xml: string }[] = [];
+    const runOpenRegex = /<hp:run\b[^>]*>/g;
+    let match: RegExpExecArray | null;
+    while ((match = runOpenRegex.exec(paragraphXml)) !== null) {
+      const runStart = match.index;
+      let depth = 1;
+      let pos = runStart + match[0].length;
+      while (depth > 0 && pos < paragraphXml.length) {
+        const nextOpen = paragraphXml.indexOf('<hp:run', pos);
+        const nextClose = paragraphXml.indexOf('</hp:run>', pos);
+        if (nextClose === -1) break;
+        if (nextOpen !== -1 && nextOpen < nextClose) {
+          depth++;
+          pos = nextOpen + '<hp:run'.length;
+        } else {
+          depth--;
+          if (depth === 0) {
+            const runEnd = nextClose + '</hp:run>'.length;
+            runRanges.push({ start: runStart, end: runEnd, xml: paragraphXml.slice(runStart, runEnd) });
+          }
+          pos = nextClose + '</hp:run>'.length;
+        }
+      }
+    }
+
+    // Mirror replaceRunsInParagraphDirect's filter: only count runs that carry <hp:t>
+    // (open-close pair or self-closing) as text-bearing runs. Other runs are left
+    // untouched so their in-memory counterparts (if any) don't desync indices.
+    const textRuns = runRanges.filter(
+      r => /<hp:t\b/.test(r.xml) || /<hp:t\s*\/>/.test(r.xml)
+    );
+
+    // Codex P1 (2026-04-22): HwpxParser.parseRun() pushes MULTIPLE in-memory run
+    // entries per single XML <hp:run> when that run's <hp:t> content includes
+    // inline controls (<hp:tab/>, <hp:lineBreak/>, <hp:nbSpace/>, <hp:fwSpace/>,
+    // <hp:autoNum/>, <hp:newNum/>, <hp:indexMark/>, <hp:pageNum/>, etc. — see
+    // HwpxParser.processTextContent). That means `paragraph.runs[i]` is NOT
+    // guaranteed to correspond to `textRuns[i]`: counts can diverge whenever
+    // any text-bearing XML run carries one of those controls.
+    //
+    // The prior loop paired them positionally, so for a paragraph like
+    //   <hp:run><hp:t>a</hp:t></hp:run>
+    //   <hp:run><hp:t>b<hp:tab/>c</hp:t></hp:run>
+    //   <hp:run><hp:t>d</hp:t></hp:run>
+    // textRuns.length = 3 but paragraph.runs.length = 5. Iterating i=0..2 would
+    // overlay `runs[2].text` (the in-memory tab sentinel, empty) onto the third
+    // XML run — silently blanking the "d" text of an unedited copy.
+    //
+    // Safe rule: only overlay when `runs.length === textRuns.length`, which is
+    // the common 1:1 case with no embedded controls. A mismatch signals the
+    // split-segment case above; in that case we leave the cloned XML untouched
+    // (it already reflects the source bytes, which is the correct default for
+    // an unedited copy). The fallback injection branch below still handles the
+    // distinct "no text-bearing runs at all" case.
+    if (runs.length === textRuns.length) {
+      // Overlay in reverse so earlier slice indices stay valid after each splice.
+      for (let i = textRuns.length - 1; i >= 0; i--) {
+        const run = textRuns[i];
+        const newText = runs[i].text ?? '';
+        const escaped = this.escapeXml(newText);
+        let newRunXml = run.xml;
+        if (/<hp:t\s*\/>/.test(newRunXml)) {
+          newRunXml = newRunXml.replace(/<hp:t\s*\/>/, `<hp:t>${escaped}</hp:t>`);
+        } else if (/<hp:t\b[^>]*>/.test(newRunXml)) {
+          newRunXml = newRunXml.replace(
+            /(<hp:t\b[^>]*>)[^<]*(<\/hp:t>)/,
+            `$1${escaped}$2`
+          );
+        }
+        paragraphXml = paragraphXml.slice(0, run.start) + newRunXml + paragraphXml.slice(run.end);
+      }
+    }
+
+    // Codex P2 (2026-04-22): HwpxParser.parseRun() only materialises an
+    // in-memory run when the source has at least one <hp:t> tag. When
+    // updateParagraphText() is called on such a paragraph it auto-synthesises
+    // run 0 in memory and pushes a pending direct-text update. For the COPY
+    // path specifically, that pending update only targets the source — the
+    // clone carries a deep-copy of runs[0] but its XML (cloned from the zip
+    // bytes) has no <hp:t> for the overlay above to write into. Inject a
+    // <hp:t> into the first <hp:run> so the saved copy preserves the update.
+    if (textRuns.length === 0 && runRanges.length > 0) {
+      // Aggregate non-empty in-memory text (usually just runs[0]); preserve
+      // order so multiple in-memory runs end up in one <hp:t> in the right
+      // sequence. This is a narrow fallback — we only enter this branch when
+      // there are NO text-bearing runs in the XML at all.
+      const aggregatedText = runs.map(r => r.text ?? '').join('');
+      if (aggregatedText !== '') {
+        const escaped = this.escapeXml(aggregatedText);
+        // Insert `<hp:t>...</hp:t>` just before the first `</hp:run>`.
+        const firstRun = runRanges[0];
+        const injectAt = firstRun.end - '</hp:run>'.length;
+        paragraphXml =
+          paragraphXml.slice(0, injectAt) +
+          `<hp:t>${escaped}</hp:t>` +
+          paragraphXml.slice(injectAt);
+      }
+    }
+
+    return paragraphXml;
+  }
+
   private async applyParagraphCopiesToXml(): Promise<void> {
     if (!this._zip) return;
 
@@ -14286,10 +15020,50 @@ export class HwpxDocument {
       const srcElem = srcElements[copy.sourceParagraph];
       if (srcElem.type !== 'p') continue;
 
-      // Clone and regenerate ID
+      // Clone and regenerate ID. Prefer the cloneId captured at call time —
+      // that is the id that copyParagraph() assigned to the in-memory clone,
+      // so keeping XML and memory in sync on ID makes later lookups reliable.
       let clonedXml = srcElem.xml;
-      const newId = Math.random().toString(36).substring(2, 11);
+      const newId = copy.cloneId ?? Math.random().toString(36).substring(2, 11);
       clonedXml = clonedXml.replace(/<(hp|hs):p\s+([^>]*?)id="[^"]*"/, `<$1:p $2id="${newId}"`);
+
+      // BUGFIX (2026-04-22): Overlay the in-memory clone's run texts onto the
+      // cloned XML. `copyParagraph()` deep-clones the source's ParagraphData at
+      // call time, so the in-memory clone already reflects any prior updates
+      // the user made to the source *before* the copy. Without this overlay,
+      // the sequence "update source → copyParagraph → save" would persist the
+      // pre-update source text in the saved copy, because the XML copy is
+      // cloned from the zip's source bytes which still hold the old text
+      // (applyDirectTextUpdatesToXml runs later in the pipeline).
+      //
+      // Codex P1-b (2026-04-22): Locate the in-memory clone by its unique
+      // cloneId. Looking it up via `targetAfter + 1` would be wrong when two
+      // or more pending copies share the same `targetAfter` — each successive
+      // copy pushes the previous clone one slot further down in section.elements,
+      // so the fixed slot now holds the most-recent clone, not the one this
+      // iteration should overlay.
+      let inMemoryClone: HwpxParagraph | undefined;
+      const tgtSection = this._content.sections[copy.targetSection];
+      if (tgtSection && copy.cloneId) {
+        for (const el of tgtSection.elements) {
+          if (el.type === 'paragraph') {
+            const para = el.data as HwpxParagraph;
+            if (para.id === copy.cloneId) {
+              inMemoryClone = para;
+              break;
+            }
+          }
+        }
+      }
+      // Fallback: if we cannot resolve by cloneId (e.g., stale pending record
+      // from a codepath that predates cloneId), skip the overlay rather than
+      // risk overlaying the wrong paragraph.
+      if (inMemoryClone) {
+        clonedXml = this.overlayInMemoryRunTextsOntoParagraphXml(
+          clonedXml,
+          inMemoryClone
+        );
+      }
 
       // Read target section
       const tgtPath = `Contents/section${copy.targetSection}.xml`;
