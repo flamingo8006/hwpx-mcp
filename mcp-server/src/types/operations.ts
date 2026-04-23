@@ -81,6 +81,26 @@ export interface PendingTableInsert {
   colWidths?: number[];
   insertOrder: number;
   tableId: string;
+  // Template presets for cell paragraphs (optional) — resolved against the
+  // active template profile. headerPreset applies to row 0; bodyPreset to all
+  // other rows. When absent, cells fall back to paraPrIDRef="0" charPrIDRef="0".
+  headerPreset?: string;
+  bodyPreset?: string;
+  // Resolved overrides (filled in by the build_document handler once presets
+  // are looked up against the active template profile). When present these
+  // values are stamped verbatim into `<hp:p>` / `<hp:run>` inside each cell.
+  overrideHeaderParaPrIDRef?: string;
+  overrideHeaderCharPrIDRef?: string;
+  overrideBodyParaPrIDRef?: string;
+  overrideBodyCharPrIDRef?: string;
+  // Optional explicit borderFillIDRef; defaults to "2" (standard template value).
+  borderFillIDRef?: string;
+  // Header cell data (row 0) from build_document. When set, the first row is
+  // populated with these texts and styled via header presets; subsequent rows
+  // use body presets. When omitted (or fewer than cols), empty cells remain.
+  headerCells?: string[];
+  // Body cell data (rows 1..n-1). Each sub-array is one row of `cols` strings.
+  bodyCells?: string[][];
 }
 
 export interface PendingImageDelete {
@@ -155,6 +175,17 @@ export interface PendingParagraphInsert {
   underline?: boolean;
   fontSize?: number;     // in pt
   fontColor?: string;    // hex
+  // Template preset (optional) — resolved against the active template profile
+  // to supply paraPrIDRef + charPrIDRef from the document's existing style
+  // palette. When preset resolves, inline style fields above are ignored so
+  // the paragraph matches the template verbatim.
+  preset?: string;
+  // Direct style-pointer overrides. When set, the paragraph/run XML uses
+  // these IDs verbatim instead of the hardcoded "0" default. Resolved by the
+  // build_document handler from `preset` before the insert is queued; callers
+  // may also set them directly to bypass the profile layer.
+  overrideParaPrIDRef?: string;
+  overrideCharPrIDRef?: string;
 }
 
 export interface PendingParagraphStyle {

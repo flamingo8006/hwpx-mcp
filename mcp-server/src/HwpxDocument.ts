@@ -492,6 +492,17 @@ export class HwpxDocument {
     };
   }
 
+  /**
+   * Returns the raw Contents/header.xml string from the backing zip, or
+   * undefined if the document hasn't been opened from a zip yet (e.g. newly
+   * created via create_document). Used by build_document to fingerprint the
+   * style palette before applying template presets.
+   */
+  async getHeaderXml(): Promise<string | undefined> {
+    if (!this._zip) return undefined;
+    return await this._zip.file('Contents/header.xml')?.async('string');
+  }
+
   getAllText(): string {
     let text = '';
     for (const section of this._content.sections) {
@@ -723,7 +734,20 @@ export class HwpxDocument {
     return true;
   }
 
-  insertParagraph(sectionIndex: number, afterElementIndex: number, text: string = '', charStyle?: { bold?: boolean; italic?: boolean; underline?: boolean; fontSize?: number; fontColor?: string }): number {
+  insertParagraph(
+    sectionIndex: number,
+    afterElementIndex: number,
+    text: string = '',
+    charStyle?: { bold?: boolean; italic?: boolean; underline?: boolean; fontSize?: number; fontColor?: string },
+    options?: {
+      /** Optional explicit paraPrIDRef (template preset) — stamped on `<hp:p>` verbatim. */
+      overrideParaPrIDRef?: string;
+      /** Optional explicit charPrIDRef (template preset) — stamped on leading `<hp:run>` verbatim. */
+      overrideCharPrIDRef?: string;
+      /** Caller-supplied preset name (logged for debugging; not used during XML generation). */
+      preset?: string;
+    },
+  ): number {
     const section = this._content.sections[sectionIndex];
     if (!section) return -1;
 
@@ -760,6 +784,9 @@ export class HwpxDocument {
       underline: charStyle?.underline,
       fontSize: charStyle?.fontSize,
       fontColor: charStyle?.fontColor,
+      preset: options?.preset,
+      overrideParaPrIDRef: options?.overrideParaPrIDRef,
+      overrideCharPrIDRef: options?.overrideCharPrIDRef,
     });
 
     this.markModified();
@@ -3950,7 +3977,35 @@ export class HwpxDocument {
   // Table Creation
   // ============================================================
 
-  insertTable(sectionIndex: number, afterElementIndex: number, rows: number, cols: number, options?: { width?: number; cellWidth?: number; colWidths?: number[] }): { tableIndex: number } | null {
+  insertTable(
+    sectionIndex: number,
+    afterElementIndex: number,
+    rows: number,
+    cols: number,
+    options?: {
+      width?: number;
+      cellWidth?: number;
+      colWidths?: number[];
+      /** Explicit borderFillIDRef for every `<hp:tc>`. When omitted defaults to "2". */
+      borderFillIDRef?: string;
+      /** Preset name recorded for debugging — not referenced during XML generation. */
+      headerPreset?: string;
+      /** Preset name recorded for debugging — not referenced during XML generation. */
+      bodyPreset?: string;
+      /** Template-resolved paraPrIDRef for row 0 cells (header). */
+      overrideHeaderParaPrIDRef?: string;
+      /** Template-resolved charPrIDRef for row 0 runs (header). */
+      overrideHeaderCharPrIDRef?: string;
+      /** Template-resolved paraPrIDRef for row 1..n-1 cells (body). */
+      overrideBodyParaPrIDRef?: string;
+      /** Template-resolved charPrIDRef for row 1..n-1 runs (body). */
+      overrideBodyCharPrIDRef?: string;
+      /** Header row cell text (length <= cols). Empty strings allowed. */
+      headerCells?: string[];
+      /** Body rows cell text (each row length <= cols). */
+      bodyCells?: string[][];
+    },
+  ): { tableIndex: number } | null {
     const section = this._content.sections[sectionIndex];
     if (!section) return null;
     if (rows <= 0 || cols <= 0) return null;
@@ -3982,6 +4037,24 @@ export class HwpxDocument {
       }
     }
 
+    // Pre-compute initial cell text so in-memory and XML stay in sync. Callers
+    // may pass headerCells (row 0) and bodyCells (rows 1..n-1) to seed the
+    // table grid in one shot — this mirrors what applyTableInsertsToXml will
+    // stamp into <hp:t>, so subsequent getTables() / getTableCell() reads see
+    // the same values before save.
+    const cellTextAt = (r: number, c: number): string => {
+      if (r === 0 && options?.headerCells && c < options.headerCells.length) {
+        return options.headerCells[c] ?? '';
+      }
+      if (r > 0 && options?.bodyCells) {
+        const bodyRow = options.bodyCells[r - 1];
+        if (bodyRow && c < bodyRow.length) {
+          return bodyRow[c] ?? '';
+        }
+      }
+      return '';
+    };
+
     const tableRows: TableRow[] = [];
     for (let r = 0; r < rows; r++) {
       const cells: TableCell[] = [];
@@ -3994,7 +4067,7 @@ export class HwpxDocument {
           width: resolvedColWidths[c],
           paragraphs: [{
             id: Math.random().toString(36).substring(2, 11),
-            runs: [{ text: '' }],
+            runs: [{ text: cellTextAt(r, c) }],
           }],
         });
       }
@@ -4033,6 +4106,15 @@ export class HwpxDocument {
       colWidths: resolvedColWidths,
       insertOrder: this._tableInsertCounter++,
       tableId: tableId,
+      headerPreset: options?.headerPreset,
+      bodyPreset: options?.bodyPreset,
+      overrideHeaderParaPrIDRef: options?.overrideHeaderParaPrIDRef,
+      overrideHeaderCharPrIDRef: options?.overrideHeaderCharPrIDRef,
+      overrideBodyParaPrIDRef: options?.overrideBodyParaPrIDRef,
+      overrideBodyCharPrIDRef: options?.overrideBodyCharPrIDRef,
+      borderFillIDRef: options?.borderFillIDRef,
+      headerCells: options?.headerCells,
+      bodyCells: options?.bodyCells,
     });
 
     this.markModified();
@@ -6107,6 +6189,13 @@ export class HwpxDocument {
       colWidths?: number[];
       insertOrder: number;
       tableId: string;
+      borderFillIDRef?: string;
+      overrideHeaderParaPrIDRef?: string;
+      overrideHeaderCharPrIDRef?: string;
+      overrideBodyParaPrIDRef?: string;
+      overrideBodyCharPrIDRef?: string;
+      headerCells?: string[];
+      bodyCells?: string[][];
     }>>();
 
     for (const insert of this._pendingTableInserts) {
@@ -6120,6 +6209,13 @@ export class HwpxDocument {
         colWidths: insert.colWidths,
         insertOrder: insert.insertOrder,
         tableId: insert.tableId,
+        borderFillIDRef: insert.borderFillIDRef,
+        overrideHeaderParaPrIDRef: insert.overrideHeaderParaPrIDRef,
+        overrideHeaderCharPrIDRef: insert.overrideHeaderCharPrIDRef,
+        overrideBodyParaPrIDRef: insert.overrideBodyParaPrIDRef,
+        overrideBodyCharPrIDRef: insert.overrideBodyCharPrIDRef,
+        headerCells: insert.headerCells,
+        bodyCells: insert.bodyCells,
       });
       insertsBySection.set(insert.sectionIndex, sectionInserts);
     }
@@ -6151,8 +6247,16 @@ export class HwpxDocument {
         const rowHeight = 1000; // Default row height in hwpunit
         const tableHeight = rowHeight * insert.rows;
 
+        // Resolve style overrides (from preset resolution at the handler layer).
+        const borderFillRef = insert.borderFillIDRef ?? '2';
+        const headerParaRef = insert.overrideHeaderParaPrIDRef ?? '0';
+        const headerCharRef = insert.overrideHeaderCharPrIDRef ?? '0';
+        const bodyParaRef   = insert.overrideBodyParaPrIDRef   ?? '0';
+        const bodyCharRef   = insert.overrideBodyCharPrIDRef   ?? '0';
+        const hasHeaderRow = !!insert.headerCells && insert.headerCells.length > 0;
+
         // Build table XML
-        let tableXml = `<hp:tbl id="${tableId}" zOrder="0" numberingType="TABLE" textWrap="TOP_AND_BOTTOM" textFlow="BOTH_SIDES" lock="0" dropcapstyle="None" pageBreak="CELL" repeatHeader="0" rowCnt="${insert.rows}" colCnt="${insert.cols}" cellSpacing="0" borderFillIDRef="2" noAdjust="0">`;
+        let tableXml = `<hp:tbl id="${tableId}" zOrder="0" numberingType="TABLE" textWrap="TOP_AND_BOTTOM" textFlow="BOTH_SIDES" lock="0" dropcapstyle="None" pageBreak="CELL" repeatHeader="${hasHeaderRow ? 1 : 0}" rowCnt="${insert.rows}" colCnt="${insert.cols}" cellSpacing="0" borderFillIDRef="${borderFillRef}" noAdjust="0">`;
         tableXml += `<hp:sz width="${insert.width}" widthRelTo="ABSOLUTE" height="${tableHeight}" heightRelTo="ABSOLUTE" protect="0"/>`;
         tableXml += `<hp:pos treatAsChar="1" affectLSpacing="0" flowWithText="1" allowOverlap="0" holdAnchorAndSO="0" vertRelTo="PARA" horzRelTo="PARA" vertAlign="TOP" horzAlign="LEFT" vertOffset="0" horzOffset="0"/>`;
         tableXml += `<hp:outMargin left="141" right="141" top="141" bottom="141"/>`;
@@ -6163,14 +6267,29 @@ export class HwpxDocument {
 
         // Generate rows
         for (let r = 0; r < insert.rows; r++) {
+          const isHeaderRow = r === 0 && hasHeaderRow;
+          const pRef = isHeaderRow ? headerParaRef : bodyParaRef;
+          const cRef = isHeaderRow ? headerCharRef : bodyCharRef;
           tableXml += `<hp:tr>`;
           for (let c = 0; c < insert.cols; c++) {
             maxId++;
             const cellParaId = maxId;
-            tableXml += `<hp:tc name="" header="0" hasMargin="0" protect="0" editable="0" dirty="0" borderFillIDRef="2">`;
+            // Resolve cell text from build_document payload, if provided.
+            let cellText = '';
+            if (isHeaderRow && insert.headerCells && c < insert.headerCells.length) {
+              cellText = insert.headerCells[c] ?? '';
+            } else if (!isHeaderRow && insert.bodyCells) {
+              const bodyRowIdx = hasHeaderRow ? r - 1 : r;
+              const bodyRow = insert.bodyCells[bodyRowIdx];
+              if (bodyRow && c < bodyRow.length) {
+                cellText = bodyRow[c] ?? '';
+              }
+            }
+            const escapedCellText = cellText ? this.escapeXml(cellText) : '';
+            tableXml += `<hp:tc name="" header="${isHeaderRow ? 1 : 0}" hasMargin="0" protect="0" editable="0" dirty="0" borderFillIDRef="${borderFillRef}">`;
             tableXml += `<hp:subList id="" textDirection="HORIZONTAL" lineWrap="BREAK" vertAlign="CENTER" linkListIDRef="0" linkListNextIDRef="0" textWidth="0" textHeight="0" hasTextRef="0" hasNumRef="0">`;
-            tableXml += `<hp:p id="${cellParaId}" paraPrIDRef="0" styleIDRef="0" pageBreak="0" columnBreak="0" merged="0">`;
-            tableXml += `<hp:run charPrIDRef="0"><hp:t></hp:t></hp:run>`;
+            tableXml += `<hp:p id="${cellParaId}" paraPrIDRef="${pRef}" styleIDRef="0" pageBreak="0" columnBreak="0" merged="0">`;
+            tableXml += `<hp:run charPrIDRef="${cRef}"><hp:t>${escapedCellText}</hp:t></hp:run>`;
             tableXml += `</hp:p>`;
             tableXml += `</hp:subList>`;
             tableXml += `<hp:cellAddr colAddr="${c}" rowAddr="${r}"/>`;
@@ -6485,6 +6604,8 @@ export class HwpxDocument {
       underline?: boolean;
       fontSize?: number;
       fontColor?: string;
+      overrideParaPrIDRef?: string;
+      overrideCharPrIDRef?: string;
     }>>();
 
     for (const insert of this._pendingParagraphInserts) {
@@ -6499,6 +6620,8 @@ export class HwpxDocument {
         underline: insert.underline,
         fontSize: insert.fontSize,
         fontColor: insert.fontColor,
+        overrideParaPrIDRef: insert.overrideParaPrIDRef,
+        overrideCharPrIDRef: insert.overrideCharPrIDRef,
       });
       insertsBySection.set(insert.sectionIndex, sectionInserts);
     }
@@ -6519,10 +6642,21 @@ export class HwpxDocument {
         // Escape text for XML
         const escapedText = this.escapeXml(insert.text);
 
-        // Determine charPrIDRef: create new charPr if inline style provided
-        let charPrIDRef = '0';
-        const hasStyle = insert.bold !== undefined || insert.italic !== undefined ||
-                         insert.underline !== undefined || insert.fontSize !== undefined || insert.fontColor !== undefined;
+        // Resolve paraPrIDRef: template-profile override wins over the "0"
+        // default. The build_document handler pre-resolves preset names into
+        // overrideParaPrIDRef before queuing, so downstream code here stays
+        // profile-agnostic.
+        const paraPrIDRef = insert.overrideParaPrIDRef ?? '0';
+
+        // Determine charPrIDRef:
+        //   1) explicit override (from preset) wins — skip inline-style cloning.
+        //   2) otherwise fall back to inline-style cloning as before.
+        let charPrIDRef = insert.overrideCharPrIDRef ?? '0';
+        const hasStyle = insert.overrideCharPrIDRef === undefined && (
+          insert.bold !== undefined || insert.italic !== undefined ||
+          insert.underline !== undefined || insert.fontSize !== undefined ||
+          insert.fontColor !== undefined
+        );
         if (hasStyle && baseCharPrXml) {
           const styleKey = JSON.stringify({ bold: insert.bold, italic: insert.italic, underline: insert.underline, fontSize: insert.fontSize, fontColor: insert.fontColor });
           if (charPrCache.has(styleKey)) {
@@ -6562,7 +6696,7 @@ export class HwpxDocument {
 
         // Build paragraph XML
         const pageBreakVal = insert.pageBreak ? '1' : '0';
-        const paragraphXml = `<hp:p id="${insert.paragraphId}" paraPrIDRef="0" styleIDRef="0" pageBreak="${pageBreakVal}" columnBreak="0" merged="0"><hp:run charPrIDRef="${charPrIDRef}"><hp:t>${escapedText}</hp:t></hp:run></hp:p>`;
+        const paragraphXml = `<hp:p id="${insert.paragraphId}" paraPrIDRef="${paraPrIDRef}" styleIDRef="0" pageBreak="${pageBreakVal}" columnBreak="0" merged="0"><hp:run charPrIDRef="${charPrIDRef}"><hp:t>${escapedText}</hp:t></hp:run></hp:p>`;
 
         // Find the position to insert
         let insertPosition = -1;
@@ -14599,24 +14733,47 @@ export class HwpxDocument {
         // Clone the template row - clear text content but preserve XML structure
         let newRowXml = templateRow.xml;
 
-        // Clear text inside <hp:t> and <hs:t> tags but preserve the tags themselves
-        newRowXml = newRowXml.replace(/<(hp|hs):t([^>]*)>[\s\S]*?<\/\1:t>/g, '<$1:t$2></$1:t>');
+        // Step 1: Normalize self-closing <hp:t/> / <hs:t/> into their open+close
+        // form so the next step's text-clearing regex matches uniformly. Without
+        // this, template rows that contain an empty <hp:t/> (common when the
+        // template cell has never held text) silently skip text injection and
+        // produce rows with missing text nodes.
+        newRowXml = newRowXml.replace(/<(hp|hs):t(\s[^/>]*)?\s*\/>/g, '<$1:t$2></$1:t>');
+
+        // Step 2: Clear any existing text inside <hp:t>...</hp:t>; preserve the
+        // tag itself and its attributes. The attrs capture must begin with
+        // whitespace so `<hp:tr>` / `<hp:tbl>` aren't misread as `<hp:t` + `r`
+        // (the bug that previously consumed entire rows up to the next
+        // `</hp:t>`).
+        newRowXml = newRowXml.replace(/<(hp|hs):t(\s[^>]*)?>[\s\S]*?<\/\1:t>/g, '<$1:t$2></$1:t>');
 
         // Update rowAddr in each cell
         const newRowAddr = insert.afterRowIndex + 1;
         newRowXml = newRowXml.replace(/rowAddr="(\d+)"/g, `rowAddr="${newRowAddr}"`);
 
-        // Set cell texts if provided
+        // Step 3: Walk cell-by-cell so we only touch the FIRST <hp:t> of each
+        // <hp:tc> (cells may contain multiple paragraphs / runs). This makes
+        // cellTexts[i] land in cell i regardless of how many <hp:t> tags the
+        // template row's cell skeleton contains, which was the source of the
+        // "malformed row" bug where stray <hp:t> captures offset injection.
         if (insert.cellTexts) {
           let cellIdx = 0;
-          newRowXml = newRowXml.replace(/<(hp|hs):t([^>]*)><\/\1:t>/g, (match, prefix, attrs) => {
-            if (cellIdx < insert.cellTexts!.length) {
-              const text = this.escapeXml(insert.cellTexts![cellIdx]);
+          newRowXml = newRowXml.replace(/<(hp|hs):tc[\s\S]*?<\/\1:tc>/g, (tcMatch, prefix) => {
+            if (cellIdx >= insert.cellTexts!.length) {
               cellIdx++;
-              return `<${prefix}:t${attrs}>${text}</${prefix}:t>`;
+              return tcMatch;
             }
+            const text = this.escapeXml(insert.cellTexts![cellIdx]);
             cellIdx++;
-            return match;
+            let injected = false;
+            // Require whitespace before any attrs so `<hp:tc>`/`<hp:tbl>` at
+            // the start of the cell isn't mistakenly targeted.
+            const tRegex = new RegExp(`<${prefix}:t(\\s[^>]*)?></${prefix}:t>`);
+            return tcMatch.replace(tRegex, (tMatch, attrs) => {
+              if (injected) return tMatch;
+              injected = true;
+              return `<${prefix}:t${attrs ?? ''}>${text}</${prefix}:t>`;
+            });
           });
         }
 
@@ -14719,9 +14876,12 @@ export class HwpxDocument {
           }
           if (!templateCell) continue;
 
-          // Clone template and clear text
+          // Clone template and clear text. Require whitespace between `:t`
+          // and attrs so `<hp:tr>`/`<hp:tc>`/`<hp:tbl>` aren't misread as
+          // `<hp:t` + `r`/`c`/`bl`; without this guard the regex would eat
+          // entire row structures up to the next `</hp:t>`.
           let newCellXml = templateCell.xml;
-          newCellXml = newCellXml.replace(/<(hp|hs):t([^>]*)>[\s\S]*?<\/\1:t>/g, '<$1:t$2></$1:t>');
+          newCellXml = newCellXml.replace(/<(hp|hs):t(\s[^>]*)?>[\s\S]*?<\/\1:t>/g, '<$1:t$2></$1:t>');
 
           // Update colAddr to afterColIndex + 1
           newCellXml = newCellXml.replace(/colAddr="(\d+)"/, `colAddr="${insert.afterColIndex + 1}"`);
