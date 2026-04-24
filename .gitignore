@@ -10,6 +10,12 @@ dist/
 mcp-server/dist/
 mcp-server/node_modules/
 
+# Distribution packaging (skill zip + local-only template copies)
+dist-skill/
+
+# Local-only binary backups created during MCP swap
+mcp-server/dist.backup-*/
+
 # VSCode extension
 *.vsix
 

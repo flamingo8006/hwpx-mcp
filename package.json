@@ -4,6 +4,7 @@
   "description": "Edit HWPX (Hangul Word Processor) documents in VSCode with AI-powered MCP integration",
   "license": "MIT",
   "version": "0.1.0",
+  "private": true,
   "publisher": "mjyoo2",
   "icon": "icon.png",
   "repository": {
