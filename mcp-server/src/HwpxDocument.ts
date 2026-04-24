@@ -6542,7 +6542,22 @@ export class HwpxDocument {
           const headerCharRef = ins.overrideHeaderCharPrIDRef ?? '0';
           const bodyParaRef = ins.overrideBodyParaPrIDRef ?? '0';
           const bodyCharRef = ins.overrideBodyCharPrIDRef ?? '0';
-          const hasHeaderRow = !!ins.headerCells && ins.headerCells.length > 0;
+          // hasHeaderRow: derive from preset intent (any header override present)
+          // OR from caller-supplied header text. Previously we checked only
+          // `headerCells.length > 0`, which silently downgraded row 0 to body
+          // styling whenever a caller requested a preset-styled table but left
+          // header text blank (filling later via update_table_cell). That
+          // produced preset regressions for exactly the workflows template
+          // mode is meant to support. (2026-04-24: Codex HIGH #2.)
+          const hasHeaderPresetIntent = !!(
+            ins.overrideHeaderParaPrIDRef ||
+            ins.overrideHeaderCharPrIDRef ||
+            ins.overrideHeaderBorderFillIDRef ||
+            ins.headerPreset
+          );
+          const hasHeaderRow =
+            hasHeaderPresetIntent ||
+            (!!ins.headerCells && ins.headerCells.length > 0);
 
           let tableXml = `<hp:tbl id="${ins.tableId}" zOrder="0" numberingType="TABLE" textWrap="TOP_AND_BOTTOM" textFlow="BOTH_SIDES" lock="0" dropcapstyle="None" pageBreak="CELL" repeatHeader="${hasHeaderRow ? 1 : 0}" rowCnt="${ins.rows}" colCnt="${ins.cols}" cellSpacing="0" borderFillIDRef="${bodyBorderRef}" noAdjust="0">`;
           tableXml += `<hp:sz width="${ins.width}" widthRelTo="ABSOLUTE" height="${tableHeight}" heightRelTo="ABSOLUTE" protect="0"/>`;

@@ -10,8 +10,10 @@ import {
 
 // Minimal header.xml fragment that satisfies every gongmun_v1 assertion.
 // Constructed to mirror the on-disk 공문서_프레임.hwpx style palette for the
-// assertion-relevant charPr / paraPr ids. Each stanza is the smallest thing
-// that makes the assertion pass — real templates carry many more attributes.
+// assertion-relevant charPr / paraPr / borderFill ids. Each stanza is the
+// smallest thing that makes the assertion pass — real templates carry many
+// more attributes. Coverage must stay exhaustive (kept in lockstep with
+// GONGMUN_V1.assertions in TemplateProfiles.ts).
 const GOOD_HEADER = `<?xml version="1.0"?>
 <hh:head xmlns:hh="http://www.hancom.co.kr/hwpml/2011/head">
   <hh:fontface lang="HANGUL">
@@ -20,17 +22,36 @@ const GOOD_HEADER = `<?xml version="1.0"?>
     <hh:font id="5" face="HY헤드라인M"/>
     <hh:font id="6" face="한양중고딕"/>
   </hh:fontface>
+  <hh:charPr id="7" height="1200">
+    <hh:fontRef hangul="3"/>
+  </hh:charPr>
   <hh:charPr id="8" height="1500">
     <hh:fontRef hangul="5"/>
   </hh:charPr>
   <hh:charPr id="16" height="2000">
     <hh:fontRef hangul="5"/>
   </hh:charPr>
+  <hh:charPr id="18" height="1300">
+    <hh:fontRef hangul="6"/>
+  </hh:charPr>
   <hh:charPr id="20" height="1500">
+    <hh:fontRef hangul="4"/>
+  </hh:charPr>
+  <hh:charPr id="21" height="1500">
     <hh:fontRef hangul="4"/>
   </hh:charPr>
   <hh:charPr id="22" height="1300">
     <hh:fontRef hangul="4"/>
+  </hh:charPr>
+  <hh:charPr id="23" height="1300">
+    <hh:fontRef hangul="6"/>
+  </hh:charPr>
+  <hh:charPr id="26" height="1200">
+    <hh:fontRef hangul="6"/>
+    <hh:bold/>
+  </hh:charPr>
+  <hh:charPr id="27" height="1000">
+    <hh:fontRef hangul="6"/>
   </hh:charPr>
   <hh:charPr id="29" height="1200">
     <hh:fontRef hangul="6"/>
@@ -39,12 +60,45 @@ const GOOD_HEADER = `<?xml version="1.0"?>
   <hh:charPr id="30" height="1200">
     <hh:fontRef hangul="6"/>
   </hh:charPr>
-  <hh:paraPr id="12" align="horizontal=&quot;CENTER&quot;">
+  <hh:paraPr id="12">
     <hh:align horizontal="CENTER"/>
+    <hh:lineSpacing type="PERCENT" value="120"/>
+  </hh:paraPr>
+  <hh:paraPr id="21">
+    <hh:align horizontal="RIGHT"/>
+    <hh:lineSpacing type="PERCENT" value="165"/>
   </hh:paraPr>
   <hh:paraPr id="22">
     <hh:align horizontal="JUSTIFY"/>
     <hh:lineSpacing type="PERCENT" value="165"/>
+  </hh:paraPr>
+  <hh:paraPr id="24">
+    <hh:align horizontal="JUSTIFY"/>
+    <hh:lineSpacing type="PERCENT" value="145"/>
+  </hh:paraPr>
+  <hh:paraPr id="25">
+    <hh:align horizontal="JUSTIFY"/>
+    <hh:lineSpacing type="PERCENT" value="160"/>
+  </hh:paraPr>
+  <hh:paraPr id="26">
+    <hh:align horizontal="JUSTIFY"/>
+    <hh:lineSpacing type="PERCENT" value="160"/>
+  </hh:paraPr>
+  <hh:paraPr id="27">
+    <hh:align horizontal="JUSTIFY"/>
+    <hh:lineSpacing type="PERCENT" value="160"/>
+  </hh:paraPr>
+  <hh:paraPr id="28">
+    <hh:align horizontal="JUSTIFY"/>
+    <hh:lineSpacing type="PERCENT" value="160"/>
+  </hh:paraPr>
+  <hh:paraPr id="29">
+    <hh:align horizontal="LEFT"/>
+    <hh:lineSpacing type="PERCENT" value="160"/>
+  </hh:paraPr>
+  <hh:paraPr id="30">
+    <hh:align horizontal="RIGHT"/>
+    <hh:lineSpacing type="PERCENT" value="160"/>
   </hh:paraPr>
   <hh:paraPr id="31">
     <hh:align horizontal="CENTER"/>
@@ -54,6 +108,19 @@ const GOOD_HEADER = `<?xml version="1.0"?>
     <hh:align horizontal="JUSTIFY"/>
     <hh:lineSpacing type="PERCENT" value="130"/>
   </hh:paraPr>
+  <hh:borderFill id="9">
+    <hh:leftBorder type="SOLID" width="0.12 mm"/>
+    <hh:rightBorder type="SOLID" width="0.12 mm"/>
+    <hh:topBorder type="SOLID" width="0.12 mm"/>
+    <hh:bottomBorder type="SOLID" width="0.12 mm"/>
+  </hh:borderFill>
+  <hh:borderFill id="10">
+    <hh:leftBorder type="SOLID" width="0.12 mm"/>
+    <hh:rightBorder type="SOLID" width="0.12 mm"/>
+    <hh:topBorder type="SOLID" width="0.12 mm"/>
+    <hh:bottomBorder type="SOLID" width="0.12 mm"/>
+    <hc:winBrush faceColor="#E5E5E5"/>
+  </hh:borderFill>
 </hh:head>`;
 
 describe('TemplateProfiles', () => {

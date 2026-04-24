@@ -34,7 +34,7 @@ export interface TableCellPresetEntry {
 
 export interface StylePaletteAssertion {
   /** Kind of entry being asserted. */
-  kind: 'charPr' | 'paraPr';
+  kind: 'charPr' | 'paraPr' | 'borderFill';
   /** The id attribute value to look up. */
   id: string;
   /** Partial match: any field listed must equal the extracted value. */
@@ -50,6 +50,13 @@ export interface StylePaletteAssertion {
     align?: string;
     /** For paraPr: line spacing value (100 = 1.0×). */
     lineSpacingValue?: string;
+    /** For borderFill: left border type (SOLID, NONE, ...). */
+    leftBorderType?: string;
+    /** For borderFill: left border width string ("0.12 mm", etc.). */
+    leftBorderWidth?: string;
+    /** For borderFill: expected winBrush faceColor (e.g. "#E5E5E5"). Pass
+     *  the string 'none' to assert that the borderFill has NO winBrush. */
+    winBrushFaceColor?: string;
   };
 }
 
@@ -122,20 +129,49 @@ const GONGMUN_V1: TemplateProfile = {
       description: '표 본문 양쪽정렬 12pt, 흰색 배경 + 0.12mm 테두리',
     },
   },
+  // Assertions MUST be exhaustive over every id referenced by `presets`
+  // and `tableCellPresets` above. If a preset resolves to id N, assertions
+  // must also constrain id N — otherwise a differently-stamped document
+  // whose palette happens to match a sampled subset could pass verification
+  // and receive wrong preset stamping. (2026-04-24: Codex HIGH #1.)
+  //
+  // Coverage: paraPr {12, 21, 22, 24, 25, 26, 27, 28, 29, 30, 31, 32}
+  //           charPr { 7,  8, 16, 18, 20, 21, 22, 23, 26, 27, 29, 30}
+  //           borderFill {9, 10}
   assertions: [
-    // Title block
-    { kind: 'charPr', id: '16', expect: { height: '2000', hangulFontFace: 'HY헤드라인M' } },
-    { kind: 'paraPr', id: '12', expect: { align: 'CENTER' } },
-    // Body hierarchy
+    // ── charPr (12 ids, values measured from the real template header.xml) ──
+    { kind: 'charPr', id: '7',  expect: { height: '1200', hangulFontFace: '휴먼고딕' } },
     { kind: 'charPr', id: '8',  expect: { height: '1500', hangulFontFace: 'HY헤드라인M' } },
-    { kind: 'paraPr', id: '22', expect: { align: 'JUSTIFY', lineSpacingValue: '165' } },
+    { kind: 'charPr', id: '16', expect: { height: '2000', hangulFontFace: 'HY헤드라인M' } },
+    { kind: 'charPr', id: '18', expect: { height: '1300', hangulFontFace: '한양중고딕' } },
     { kind: 'charPr', id: '20', expect: { height: '1500', hangulFontFace: '휴먼명조' } },
+    { kind: 'charPr', id: '21', expect: { height: '1500', hangulFontFace: '휴먼명조' } },
     { kind: 'charPr', id: '22', expect: { height: '1300', hangulFontFace: '휴먼명조' } },
-    // Table cell blocks
+    { kind: 'charPr', id: '23', expect: { height: '1300', hangulFontFace: '한양중고딕' } },
+    { kind: 'charPr', id: '26', expect: { height: '1200', hangulFontFace: '한양중고딕', bold: true } },
+    { kind: 'charPr', id: '27', expect: { height: '1000', hangulFontFace: '한양중고딕' } },
     { kind: 'charPr', id: '29', expect: { height: '1200', hangulFontFace: '한양중고딕', bold: true } },
     { kind: 'charPr', id: '30', expect: { height: '1200', hangulFontFace: '한양중고딕' } },
-    { kind: 'paraPr', id: '31', expect: { align: 'CENTER', lineSpacingValue: '130' } },
+
+    // ── paraPr (12 ids) ──
+    { kind: 'paraPr', id: '12', expect: { align: 'CENTER',  lineSpacingValue: '120' } },
+    { kind: 'paraPr', id: '21', expect: { align: 'RIGHT',   lineSpacingValue: '165' } },
+    { kind: 'paraPr', id: '22', expect: { align: 'JUSTIFY', lineSpacingValue: '165' } },
+    { kind: 'paraPr', id: '24', expect: { align: 'JUSTIFY', lineSpacingValue: '145' } },
+    { kind: 'paraPr', id: '25', expect: { align: 'JUSTIFY', lineSpacingValue: '160' } },
+    { kind: 'paraPr', id: '26', expect: { align: 'JUSTIFY', lineSpacingValue: '160' } },
+    { kind: 'paraPr', id: '27', expect: { align: 'JUSTIFY', lineSpacingValue: '160' } },
+    { kind: 'paraPr', id: '28', expect: { align: 'JUSTIFY', lineSpacingValue: '160' } },
+    { kind: 'paraPr', id: '29', expect: { align: 'LEFT',    lineSpacingValue: '160' } },
+    { kind: 'paraPr', id: '30', expect: { align: 'RIGHT',   lineSpacingValue: '160' } },
+    { kind: 'paraPr', id: '31', expect: { align: 'CENTER',  lineSpacingValue: '130' } },
     { kind: 'paraPr', id: '32', expect: { align: 'JUSTIFY', lineSpacingValue: '130' } },
+
+    // ── borderFill (2 ids referenced by table_header / table_body) ──
+    // id=9  body cell: 0.12mm solid borders, no fill
+    { kind: 'borderFill', id: '9',  expect: { leftBorderType: 'SOLID', leftBorderWidth: '0.12 mm', winBrushFaceColor: 'none' } },
+    // id=10 header cell: 0.12mm solid borders + #E5E5E5 winBrush fill
+    { kind: 'borderFill', id: '10', expect: { leftBorderType: 'SOLID', leftBorderWidth: '0.12 mm', winBrushFaceColor: '#E5E5E5' } },
   ],
 };
 
@@ -263,6 +299,43 @@ export function verifyProfileAgainstHeader(
         if (got !== a.expect.lineSpacingValue) {
           failures.push(
             `paraPr[${a.id}].lineSpacing: expected ${a.expect.lineSpacingValue}, got ${got ?? '(none)'}`,
+          );
+        }
+      }
+    } else if (a.kind === 'borderFill') {
+      const re = new RegExp(
+        `<hh:borderFill\\s+id="${a.id}"[^>]*>([\\s\\S]*?)</hh:borderFill>`,
+      );
+      const m = headerXml.match(re);
+      if (!m) {
+        failures.push(`borderFill id=${a.id} not found in header.xml`);
+        continue;
+      }
+      const body = m[1];
+      if (a.expect.leftBorderType !== undefined) {
+        const lb = body.match(/<hh:leftBorder\s+[^>]*type="([^"]+)"/);
+        const got = lb ? lb[1] : undefined;
+        if (got !== a.expect.leftBorderType) {
+          failures.push(
+            `borderFill[${a.id}].leftBorder.type: expected ${a.expect.leftBorderType}, got ${got ?? '(none)'}`,
+          );
+        }
+      }
+      if (a.expect.leftBorderWidth !== undefined) {
+        const lb = body.match(/<hh:leftBorder\s+[^>]*width="([^"]+)"/);
+        const got = lb ? lb[1] : undefined;
+        if (got !== a.expect.leftBorderWidth) {
+          failures.push(
+            `borderFill[${a.id}].leftBorder.width: expected ${a.expect.leftBorderWidth}, got ${got ?? '(none)'}`,
+          );
+        }
+      }
+      if (a.expect.winBrushFaceColor !== undefined) {
+        const wb = body.match(/<hc:winBrush\s+[^>]*faceColor="([^"]+)"/);
+        const got = wb ? wb[1] : 'none';
+        if (got !== a.expect.winBrushFaceColor) {
+          failures.push(
+            `borderFill[${a.id}].winBrush.faceColor: expected ${a.expect.winBrushFaceColor}, got ${got}`,
           );
         }
       }
