@@ -1547,6 +1547,18 @@ export interface HwpxParagraph {
   listType?: 'none' | 'bullet' | 'number';
   listLevel?: number;
   linesegs?: LineSeg[];  // Pre-calculated layout info from HWPX
+  /**
+   * True when this paragraph's XML contains a nested `<hp:tbl>` as a decorative
+   * wrapper (e.g. the DGIST 공문서 frame's title/summary boxes). The parser
+   * promotes the nested table to `section.elements[]` as a separate `type:'table'`
+   * entry, so mem-space has 2 elements (wrapper-p + nested tbl) while the XML
+   * walker — which uses `findClosingTagPosition('<hp:p ')` to jump over the
+   * whole wrapper — sees only 1 top-level element. Insert-position logic must
+   * skip the nested tbl when translating mem indices to walker indices to
+   * prevent table inserts from silently falling back to `</hs:sec>` and
+   * landing at the top of the body.
+   */
+  wrapsTable?: boolean;
   // XML position cache for direct updates (populated during parsing, invalidated on save)
   _xmlPosition?: {
     sectionIndex: number;  // Which section this paragraph belongs to

@@ -102,17 +102,24 @@ const GONGMUN_V1: TemplateProfile = {
     table_note:       { paraPrIDRef: '29', charPrIDRef: '27', description: '주: 표 주석 10pt 왼쪽정렬' },
   },
   tableCellPresets: {
+    // borderFill id palette for 공문서_프레임.hwpx:
+    //   id="2"  — NONE on all sides (invisible borders, do not use)
+    //   id="9"  — SOLID 0.12mm on all 4 sides, no fillBrush (= white body)
+    //   id="10" — SOLID 0.12mm on all 4 sides + <hc:winBrush faceColor="#E5E5E5"/>
+    //             (= gray-filled header). Matches "▷ 표 형 식 : 테두리 0.12mm".
+    // Applying id="10" to every cell would fill body rows gray too, so the
+    // header preset keeps id="10" while the body preset uses id="9".
     table_header: {
       paraPrIDRef: '31',
       charPrIDRef: '29',
-      borderFillIDRef: '2',
-      description: '표 헤더 중앙정렬 12pt BOLD (130% line-spacing)',
+      borderFillIDRef: '10',
+      description: '표 헤더 중앙정렬 12pt BOLD, 회색(#E5E5E5) 채움 + 0.12mm 테두리',
     },
     table_body: {
       paraPrIDRef: '32',
       charPrIDRef: '30',
-      borderFillIDRef: '2',
-      description: '표 본문 양쪽정렬 12pt (130% line-spacing)',
+      borderFillIDRef: '9',
+      description: '표 본문 양쪽정렬 12pt, 흰색 배경 + 0.12mm 테두리',
     },
   },
   assertions: [

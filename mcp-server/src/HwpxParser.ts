@@ -1230,7 +1230,7 @@ export class HwpxParser {
     cleanedXml = cleanedXml.replace(/<hp:footNote\b[^>]*>[\s\S]*?<\/hp:footNote>/gi, '');
     cleanedXml = cleanedXml.replace(/<hp:endNote\b[^>]*>[\s\S]*?<\/hp:endNote>/gi, '');
 
-    const elements: { index: number; type: string; xml: string; parentLinesegs?: import('./types').LineSeg[]; originalXmlPosition?: { start: number; end: number } }[] = [];
+    const elements: { index: number; type: string; xml: string; parentLinesegs?: import('./types').LineSeg[]; originalXmlPosition?: { start: number; end: number }; wrapsTable?: boolean }[] = [];
 
     // Extract ALL paragraphs first to find parent paragraphs for tables
     const paragraphs = this.extractAllParagraphs(cleanedXml);
@@ -1354,7 +1354,11 @@ export class HwpxParser {
           // Only add if there's remaining content besides lineseg
           const hasTextContent = /<hp:t\b[^>]*>/.test(paraXmlWithoutTable);
           if (hasTextContent) {
-            elements.push({ index: para.start, type: 'p', xml: paraXmlWithoutTable, originalXmlPosition: origPos });
+            // Mark this wrapper paragraph as containing a nested table. The
+            // save-time walker in HwpxDocument absorbs the nested <hp:tbl>
+            // into the wrapper's <hp:p>...</hp:p> span, so insert-position
+            // translation must skip the separate nested-tbl mem element.
+            elements.push({ index: para.start, type: 'p', xml: paraXmlWithoutTable, originalXmlPosition: origPos, wrapsTable: true });
             originalParaIndex++;
           }
         } else {
@@ -1522,6 +1526,13 @@ export class HwpxParser {
             start: el.originalXmlPosition.start,
             end: el.originalXmlPosition.end,
           };
+        }
+
+        // Propagate wrapsTable flag (set when this paragraph's XML contains a
+        // nested <hp:tbl>) so insert-position logic can skip the nested-tbl
+        // mem element when translating mem→walker indices at save time.
+        if (el.wrapsTable) {
+          paragraph.wrapsTable = true;
         }
 
         // Check if this paragraph should have a footnote reference

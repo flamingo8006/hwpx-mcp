@@ -125,7 +125,16 @@ export class HwpxDocument {
   private _pendingImageInserts: PendingImageInsert[] = [];
   private _pendingCellImageInserts: PendingCellImageInsert[] = [];
   private _pendingTableInserts: PendingTableInsert[] = [];
-  private _tableInsertCounter = 0;
+  /**
+   * Shared monotonic counter assigned to every paragraph and table insert
+   * so the two pending queues can be merged and applied to XML in a single
+   * interleaved pass (see applyPendingInsertsToXml). Previously tables had
+   * their own counter and paragraphs had none, and the save pipeline flushed
+   * all tables BEFORE all paragraphs — which, on templates whose body starts
+   * empty, pushed the tables past `</hs:sec>` fallback to the top of the
+   * body. Unifying the counter + the apply pass fixes that.
+   */
+  private _insertOrderCounter = 0;
   private _pendingImageDeletes: PendingImageDelete[] = [];
   private _pendingTableDeletes: PendingTableDelete[] = [];
   private _pendingParagraphDeletes: PendingParagraphDelete[] = [];
@@ -773,7 +782,8 @@ export class HwpxDocument {
     const newElement: SectionElement = { type: 'paragraph', data: newParagraph };
     section.elements.splice(resolvedAfterIndex + 1, 0, newElement);
 
-    // Add to pending list for XML sync
+    // Add to pending list for XML sync. insertOrder is shared with table
+    // inserts so the save-time apply pass interleaves them in call order.
     this._pendingParagraphInserts.push({
       sectionIndex,
       afterElementIndex: resolvedAfterIndex,
@@ -787,6 +797,7 @@ export class HwpxDocument {
       preset: options?.preset,
       overrideParaPrIDRef: options?.overrideParaPrIDRef,
       overrideCharPrIDRef: options?.overrideCharPrIDRef,
+      insertOrder: this._insertOrderCounter++,
     });
 
     this.markModified();
@@ -819,6 +830,7 @@ export class HwpxDocument {
       paragraphId,
       text: '',
       pageBreak: true,
+      insertOrder: this._insertOrderCounter++,
     });
 
     this.markModified();
@@ -3986,8 +3998,17 @@ export class HwpxDocument {
       width?: number;
       cellWidth?: number;
       colWidths?: number[];
-      /** Explicit borderFillIDRef for every `<hp:tc>`. When omitted defaults to "2". */
+      /** Explicit borderFillIDRef for every `<hp:tc>` (applied when the
+       *  per-row overrides below are absent). When omitted defaults to "2". */
       borderFillIDRef?: string;
+      /** borderFillIDRef for row 0 cells (header). Wins over `borderFillIDRef`
+       *  when set. Typical use: id="10" which carries a built-in gray fill via
+       *  `<hc:winBrush faceColor="#E5E5E5"/>`. */
+      overrideHeaderBorderFillIDRef?: string;
+      /** borderFillIDRef for rows 1..n-1 (body). Wins over `borderFillIDRef`
+       *  when set. Typical use: id="9" (SOLID 0.12mm borders, no fillBrush =
+       *  white background). */
+      overrideBodyBorderFillIDRef?: string;
       /** Preset name recorded for debugging — not referenced during XML generation. */
       headerPreset?: string;
       /** Preset name recorded for debugging — not referenced during XML generation. */
@@ -4104,7 +4125,7 @@ export class HwpxDocument {
       width: totalWidth,
       cellWidth: resolvedColWidths[0], // Legacy fallback for uniform width
       colWidths: resolvedColWidths,
-      insertOrder: this._tableInsertCounter++,
+      insertOrder: this._insertOrderCounter++,
       tableId: tableId,
       headerPreset: options?.headerPreset,
       bodyPreset: options?.bodyPreset,
@@ -4113,6 +4134,8 @@ export class HwpxDocument {
       overrideBodyParaPrIDRef: options?.overrideBodyParaPrIDRef,
       overrideBodyCharPrIDRef: options?.overrideBodyCharPrIDRef,
       borderFillIDRef: options?.borderFillIDRef,
+      overrideHeaderBorderFillIDRef: options?.overrideHeaderBorderFillIDRef,
+      overrideBodyBorderFillIDRef: options?.overrideBodyBorderFillIDRef,
       headerCells: options?.headerCells,
       bodyCells: options?.bodyCells,
     });
@@ -5363,9 +5386,16 @@ export class HwpxDocument {
   private async syncContentToZip(): Promise<void> {
     if (!this._zip) return;
 
-    // Apply table inserts FIRST (other operations depend on tables existing in XML)
-    if (this._pendingTableInserts && this._pendingTableInserts.length > 0) {
-      await this.applyTableInsertsToXml();
+    // Apply paragraph + table inserts in a single unified pass, ordered by
+    // shared insertOrder. See `applyPendingInsertsToXml` for why this must
+    // be one pass (previously separate passes broke template-frame inserts
+    // where tables would fall back to `</hs:sec>` and land at document top).
+    if (
+      (this._pendingParagraphInserts && this._pendingParagraphInserts.length > 0) ||
+      (this._pendingTableInserts && this._pendingTableInserts.length > 0)
+    ) {
+      await this.applyPendingInsertsToXml();
+      this._pendingParagraphInserts = [];
       this._pendingTableInserts = [];
     }
 
@@ -5385,12 +5415,6 @@ export class HwpxDocument {
     if (this._pendingTableMoves && this._pendingTableMoves.length > 0) {
       await this.applyTableMovesToXml();
       this._pendingTableMoves = [];
-    }
-
-    // Apply paragraph inserts
-    if (this._pendingParagraphInserts && this._pendingParagraphInserts.length > 0) {
-      await this.applyParagraphInsertsToXml();
-      this._pendingParagraphInserts = [];
     }
 
     // Apply paragraph copies
@@ -6173,8 +6197,388 @@ export class HwpxDocument {
   }
 
   /**
+   * Translate mem-space afterElementIndex to walker-space (XML position).
+   *
+   * Mem-space: `section.elements[]` — the parser promotes nested tables inside
+   * wrapper paragraphs (e.g. the DGIST 공문서 프레임 title/summary boxes) to
+   * their own entries, so one XML `<hp:p>` can correspond to two mem entries
+   * (wrapper-p + nested-tbl).
+   *
+   * Walker-space: the XML walker used by `applyPendingInsertsToXml` counts
+   * top-level `<hp:p>` and `<hp:tbl>` via `findClosingTagPosition('<hp:p ')`,
+   * which swallows the nested tbl inside its wrapper. So a `wrapsTable`
+   * wrapper counts as 1 in walker-space, and the nested tbl mem-entry counts
+   * as 0. Additionally, pending inserts that haven't been applied yet don't
+   * exist in the current XML — we skip them when translating.
+   */
+  private computeWalkerTargetIndex(
+    sectionIndex: number,
+    memAfterElementIndex: number,
+    appliedInsertIds: Set<string>,
+    pendingInsertIds: Set<string>,
+  ): number {
+    const section = this._content.sections[sectionIndex];
+    if (!section) return -1;
+    if (memAfterElementIndex < 0) return -1;
+
+    let walkerCount = 0;
+    const cap = Math.min(memAfterElementIndex, section.elements.length - 1);
+
+    for (let i = 0; i <= cap; i++) {
+      const el = section.elements[i];
+
+      // Skip nested tables: parser promotes the tbl inside a wrapsTable
+      // wrapper paragraph to its own mem entry, but the walker swallows it
+      // via the wrapper's <hp:p> closing tag. Recognise it by looking at the
+      // previous mem entry.
+      if (el.type === 'table') {
+        const prev = i > 0 ? section.elements[i - 1] : null;
+        if (prev?.type === 'paragraph' && (prev.data as HwpxParagraph).wrapsTable) {
+          continue;
+        }
+      }
+
+      // Resolve the entry's stable id (paragraph.id or table.id).
+      let entryId: string | undefined;
+      if (el.type === 'paragraph') entryId = (el.data as HwpxParagraph).id;
+      else if (el.type === 'table') entryId = (el.data as HwpxTable).id;
+
+      // Skip pending inserts that haven't been applied to XML yet — they
+      // exist in mem (splice at queue time) but not in the current XML.
+      if (entryId && pendingInsertIds.has(entryId) && !appliedInsertIds.has(entryId)) {
+        continue;
+      }
+
+      walkerCount++;
+    }
+
+    return walkerCount - 1;
+  }
+
+  /**
+   * Unified apply pass for pending paragraph and table inserts.
+   *
+   * Processes both queues in shared `insertOrder` ascending, so interleaved
+   * queue sequences (e.g. a report with intermixed paragraphs + data tables)
+   * land in the XML in the exact order they were queued.
+   *
+   * Previously there were two separate passes: `applyTableInsertsToXml` ran
+   * first, then `applyParagraphInsertsToXml`. That split broke template-frame
+   * inserts — tables were written before any newly-queued paragraphs existed
+   * in the XML, so their walker-targets resolved against a stale layout, and
+   * because the walker only sees top-level elements (wrapsTable wrappers
+   * absorb their nested tbl) mem-space indices overshot the available walker
+   * positions and fell back to `</hs:sec>`. Paragraphs then inserted after,
+   * pushing the already-placed tables toward the top of the body.
+   */
+  private async applyPendingInsertsToXml(): Promise<void> {
+    if (!this._zip) return;
+    const paraInserts = this._pendingParagraphInserts ?? [];
+    const tableInserts = this._pendingTableInserts ?? [];
+    if (paraInserts.length === 0 && tableInserts.length === 0) return;
+
+    const hasInlineCharStyle = paraInserts.some(
+      ins => ins.overrideCharPrIDRef === undefined && (
+        ins.bold !== undefined || ins.italic !== undefined ||
+        ins.underline !== undefined || ins.fontSize !== undefined ||
+        ins.fontColor !== undefined
+      )
+    );
+
+    let headerXml: string | undefined;
+    let maxCharPrId = 0;
+    let baseCharPrXml = '';
+    const charPrCache = new Map<string, number>();
+    const newCharPrs: string[] = [];
+
+    if (hasInlineCharStyle) {
+      const headerPath = 'Contents/header.xml';
+      headerXml = await this._zip.file(headerPath)?.async('string');
+      if (headerXml) {
+        const idRegex = /<hh:charPr\s+[^>]*id="(\d+)"/g;
+        let m;
+        while ((m = idRegex.exec(headerXml)) !== null) {
+          maxCharPrId = Math.max(maxCharPrId, parseInt(m[1], 10));
+        }
+        const shapeIdRegex = /<hh:charShape\s+[^>]*id="(\d+)"/g;
+        while ((m = shapeIdRegex.exec(headerXml)) !== null) {
+          maxCharPrId = Math.max(maxCharPrId, parseInt(m[1], 10));
+        }
+        const baseMatch = headerXml.match(/<hh:charPr\s+[^>]*id="0"[^>]*>[\s\S]*?<\/hh:charPr>/);
+        if (baseMatch) {
+          baseCharPrXml = baseMatch[0];
+        } else {
+          const baseShapeMatch = headerXml.match(/<hh:charShape\s+[^>]*id="0"[^>]*>[\s\S]*?<\/hh:charShape>/)
+            || headerXml.match(/<hh:charShape\s+[^>]*id="0"[^/]*\/>/);
+          if (baseShapeMatch) {
+            baseCharPrXml = baseShapeMatch[0]
+              .replace(/<hh:charShape\b/g, '<hh:charPr')
+              .replace(/<\/hh:charShape>/g, '</hh:charPr>')
+              .replace(/\/>$/, '></hh:charPr>');
+          }
+        }
+      }
+    }
+
+    // Group inserts by section, tagged by kind. Each section collects the
+    // union of paragraph and table inserts so we can sort them by insertOrder.
+    type Tagged =
+      | { kind: 'paragraph'; order: number; insert: PendingParagraphInsert }
+      | { kind: 'table'; order: number; insert: PendingTableInsert };
+    const bySection = new Map<number, Tagged[]>();
+    const pendingIdsBySection = new Map<number, Set<string>>();
+
+    for (const ins of paraInserts) {
+      const list = bySection.get(ins.sectionIndex) ?? [];
+      list.push({ kind: 'paragraph', order: ins.insertOrder ?? 0, insert: ins });
+      bySection.set(ins.sectionIndex, list);
+      const ids = pendingIdsBySection.get(ins.sectionIndex) ?? new Set<string>();
+      ids.add(ins.paragraphId);
+      pendingIdsBySection.set(ins.sectionIndex, ids);
+    }
+    for (const ins of tableInserts) {
+      const list = bySection.get(ins.sectionIndex) ?? [];
+      list.push({ kind: 'table', order: ins.insertOrder ?? 0, insert: ins });
+      bySection.set(ins.sectionIndex, list);
+      const ids = pendingIdsBySection.get(ins.sectionIndex) ?? new Set<string>();
+      ids.add(ins.tableId);
+      pendingIdsBySection.set(ins.sectionIndex, ids);
+    }
+
+    for (const [sectionIndex, items] of bySection) {
+      const sectionPath = `Contents/section${sectionIndex}.xml`;
+      const file = this._zip.file(sectionPath);
+      if (!file) continue;
+      let xml = await file.async('string');
+
+      // Max id across the section XML — used to mint unique ids for new
+      // table cell paragraphs and wrapper paragraphs.
+      let maxId = 0;
+      const idMatches = xml.matchAll(/id="(\d+)"/g);
+      for (const m of idMatches) {
+        maxId = Math.max(maxId, parseInt(m[1], 10));
+      }
+
+      const sorted = [...items].sort((a, b) => a.order - b.order);
+      const appliedIds = new Set<string>();
+      const pendingIds = pendingIdsBySection.get(sectionIndex) ?? new Set<string>();
+
+      for (const item of sorted) {
+        const memAfterIndex = item.insert.afterElementIndex;
+        const walkerTarget = this.computeWalkerTargetIndex(
+          sectionIndex, memAfterIndex, appliedIds, pendingIds
+        );
+
+        let insertPosition = -1;
+
+        if (walkerTarget >= 0) {
+          let elementCount = -1;
+          let searchPos = 0;
+          while (searchPos < xml.length) {
+            const nextP = xml.indexOf('<hp:p ', searchPos);
+            const nextTbl = xml.indexOf('<hp:tbl ', searchPos);
+            let nextPos = -1;
+            let isTable = false;
+            if (nextP !== -1 && (nextTbl === -1 || nextP < nextTbl)) {
+              nextPos = nextP; isTable = false;
+            } else if (nextTbl !== -1) {
+              nextPos = nextTbl; isTable = true;
+            }
+            if (nextPos === -1) break;
+
+            const beforeText = xml.substring(Math.max(0, nextPos - HwpxDocument.NESTED_CHECK_LOOKBACK), nextPos);
+            const subListOpen = beforeText.lastIndexOf('<hp:subList');
+            const subListClose = beforeText.lastIndexOf('</hp:subList>');
+            const isNested = subListOpen > subListClose;
+
+            if (!isNested) {
+              elementCount++;
+              const endPos = isTable
+                ? HwpxDocument.findClosingTagPosition(xml, nextPos + 1, '<hp:tbl', '</hp:tbl>')
+                : HwpxDocument.findClosingTagPosition(xml, nextPos + 1, '<hp:p ', '</hp:p>');
+              if (endPos === -1) {
+                searchPos = nextPos + HwpxDocument.SEARCH_SKIP_OFFSET;
+                continue;
+              }
+              if (elementCount === walkerTarget) { insertPosition = endPos; break; }
+              searchPos = endPos;
+            } else {
+              searchPos = nextPos + HwpxDocument.SEARCH_SKIP_OFFSET;
+            }
+          }
+        }
+
+        // Legacy safety net: paragraph inserts with afterElementIndex === -1
+        // were meant to land after the first <hp:p> (which carries secPr).
+        // `insertParagraph` remaps -1 → 0 in mem, but keep this branch as a
+        // backstop for callers that bypass insertParagraph().
+        if (insertPosition === -1 && item.kind === 'paragraph' && item.insert.afterElementIndex === -1) {
+          const firstPStart = xml.indexOf('<hp:p');
+          if (firstPStart !== -1) {
+            const firstPEnd = xml.indexOf('</hp:p>', firstPStart);
+            if (firstPEnd !== -1) insertPosition = firstPEnd + '</hp:p>'.length;
+          }
+        }
+
+        // Fallback: end of section. If walker-target overshoots (e.g. stale
+        // mem index) we still produce valid XML rather than dropping silently.
+        if (insertPosition === -1) {
+          const secEnd = xml.lastIndexOf('</hs:sec>');
+          if (secEnd !== -1) insertPosition = secEnd;
+        }
+
+        if (insertPosition === -1) continue;
+
+        let snippet: string;
+        if (item.kind === 'paragraph') {
+          const ins = item.insert;
+          const escapedText = this.escapeXml(ins.text);
+          const paraPrIDRef = ins.overrideParaPrIDRef ?? '0';
+          let charPrIDRef = ins.overrideCharPrIDRef ?? '0';
+          const hasStyle = ins.overrideCharPrIDRef === undefined && (
+            ins.bold !== undefined || ins.italic !== undefined ||
+            ins.underline !== undefined || ins.fontSize !== undefined ||
+            ins.fontColor !== undefined
+          );
+          if (hasStyle && baseCharPrXml) {
+            const styleKey = JSON.stringify({ bold: ins.bold, italic: ins.italic, underline: ins.underline, fontSize: ins.fontSize, fontColor: ins.fontColor });
+            if (charPrCache.has(styleKey)) {
+              charPrIDRef = String(charPrCache.get(styleKey));
+            } else {
+              const newId = ++maxCharPrId;
+              charPrCache.set(styleKey, newId);
+              charPrIDRef = String(newId);
+              let cloned = baseCharPrXml.replace(/id="\d+"/, `id="${newId}"`);
+              if (ins.fontSize) {
+                const heightVal = Math.round(ins.fontSize * 100);
+                cloned = cloned.replace(/height="\d+"/, `height="${heightVal}"`);
+              }
+              if (ins.fontColor) {
+                cloned = cloned.replace(/textColor="[^"]*"/, `textColor="#${ins.fontColor}"`);
+              }
+              if (ins.bold) {
+                if (!cloned.includes('<hh:bold')) cloned = cloned.replace('</hh:charPr>', '<hh:bold/></hh:charPr>');
+              } else if (ins.bold === false) {
+                cloned = cloned.replace(/<hh:bold[^/]*\/>/g, '');
+              }
+              if (ins.italic) {
+                if (!cloned.includes('<hh:italic')) cloned = cloned.replace('</hh:charPr>', '<hh:italic/></hh:charPr>');
+              } else if (ins.italic === false) {
+                cloned = cloned.replace(/<hh:italic[^/]*\/>/g, '');
+              }
+              if (ins.underline) {
+                if (!cloned.includes('<hh:underline')) cloned = cloned.replace('</hh:charPr>', '<hh:underline/></hh:charPr>');
+              } else if (ins.underline === false) {
+                cloned = cloned.replace(/<hh:underline[^/]*\/>/g, '');
+              }
+              newCharPrs.push(cloned);
+            }
+          }
+          const pageBreakVal = ins.pageBreak ? '1' : '0';
+          snippet = `<hp:p id="${ins.paragraphId}" paraPrIDRef="${paraPrIDRef}" styleIDRef="0" pageBreak="${pageBreakVal}" columnBreak="0" merged="0"><hp:run charPrIDRef="${charPrIDRef}"><hp:t>${escapedText}</hp:t></hp:run></hp:p>`;
+          appliedIds.add(ins.paragraphId);
+        } else {
+          const ins = item.insert;
+          const rowHeight = 1000;
+          const tableHeight = rowHeight * ins.rows;
+          const defaultBorderFillRef = ins.borderFillIDRef ?? '2';
+          const headerBorderRef = ins.overrideHeaderBorderFillIDRef ?? defaultBorderFillRef;
+          const bodyBorderRef = ins.overrideBodyBorderFillIDRef ?? defaultBorderFillRef;
+          const headerParaRef = ins.overrideHeaderParaPrIDRef ?? '0';
+          const headerCharRef = ins.overrideHeaderCharPrIDRef ?? '0';
+          const bodyParaRef = ins.overrideBodyParaPrIDRef ?? '0';
+          const bodyCharRef = ins.overrideBodyCharPrIDRef ?? '0';
+          const hasHeaderRow = !!ins.headerCells && ins.headerCells.length > 0;
+
+          let tableXml = `<hp:tbl id="${ins.tableId}" zOrder="0" numberingType="TABLE" textWrap="TOP_AND_BOTTOM" textFlow="BOTH_SIDES" lock="0" dropcapstyle="None" pageBreak="CELL" repeatHeader="${hasHeaderRow ? 1 : 0}" rowCnt="${ins.rows}" colCnt="${ins.cols}" cellSpacing="0" borderFillIDRef="${bodyBorderRef}" noAdjust="0">`;
+          tableXml += `<hp:sz width="${ins.width}" widthRelTo="ABSOLUTE" height="${tableHeight}" heightRelTo="ABSOLUTE" protect="0"/>`;
+          tableXml += `<hp:pos treatAsChar="1" affectLSpacing="0" flowWithText="1" allowOverlap="0" holdAnchorAndSO="0" vertRelTo="PARA" horzRelTo="PARA" vertAlign="TOP" horzAlign="LEFT" vertOffset="0" horzOffset="0"/>`;
+          tableXml += `<hp:outMargin left="141" right="141" top="141" bottom="141"/>`;
+          tableXml += `<hp:inMargin left="0" right="0" top="0" bottom="0"/>`;
+          const colWidths = ins.colWidths || Array(ins.cols).fill(ins.cellWidth);
+          for (let r = 0; r < ins.rows; r++) {
+            const isHeaderRow = r === 0 && hasHeaderRow;
+            const pRef = isHeaderRow ? headerParaRef : bodyParaRef;
+            const cRef = isHeaderRow ? headerCharRef : bodyCharRef;
+            const rowBorderRef = isHeaderRow ? headerBorderRef : bodyBorderRef;
+            tableXml += `<hp:tr>`;
+            for (let c = 0; c < ins.cols; c++) {
+              maxId++;
+              const cellParaId = maxId;
+              let cellText = '';
+              if (isHeaderRow && ins.headerCells && c < ins.headerCells.length) {
+                cellText = ins.headerCells[c] ?? '';
+              } else if (!isHeaderRow && ins.bodyCells) {
+                const bodyRowIdx = hasHeaderRow ? r - 1 : r;
+                const bodyRow = ins.bodyCells[bodyRowIdx];
+                if (bodyRow && c < bodyRow.length) {
+                  cellText = bodyRow[c] ?? '';
+                }
+              }
+              const escapedCellText = cellText ? this.escapeXml(cellText) : '';
+              tableXml += `<hp:tc name="" header="${isHeaderRow ? 1 : 0}" hasMargin="0" protect="0" editable="0" dirty="0" borderFillIDRef="${rowBorderRef}">`;
+              tableXml += `<hp:subList id="" textDirection="HORIZONTAL" lineWrap="BREAK" vertAlign="CENTER" linkListIDRef="0" linkListNextIDRef="0" textWidth="0" textHeight="0" hasTextRef="0" hasNumRef="0">`;
+              tableXml += `<hp:p id="${cellParaId}" paraPrIDRef="${pRef}" styleIDRef="0" pageBreak="0" columnBreak="0" merged="0">`;
+              tableXml += `<hp:run charPrIDRef="${cRef}"><hp:t>${escapedCellText}</hp:t></hp:run>`;
+              tableXml += `</hp:p>`;
+              tableXml += `</hp:subList>`;
+              tableXml += `<hp:cellAddr colAddr="${c}" rowAddr="${r}"/>`;
+              tableXml += `<hp:cellSpan colSpan="1" rowSpan="1"/>`;
+              tableXml += `<hp:cellSz width="${colWidths[c]}" height="${rowHeight}"/>`;
+              tableXml += `<hp:cellMargin left="141" right="141" top="141" bottom="141"/>`;
+              tableXml += `</hp:tc>`;
+            }
+            tableXml += `</hp:tr>`;
+          }
+          tableXml += `<hp:colSz>${colWidths.join(' ')}</hp:colSz>`;
+          tableXml += `</hp:tbl>`;
+          snippet = `<hp:p id="${maxId + 1}" paraPrIDRef="0" styleIDRef="0" pageBreak="0" columnBreak="0" merged="0"><hp:run charPrIDRef="0">${tableXml}<hp:t></hp:t></hp:run></hp:p>`;
+          maxId++;
+          appliedIds.add(ins.tableId);
+        }
+
+        xml = xml.substring(0, insertPosition) + snippet + xml.substring(insertPosition);
+      }
+
+      this._zip.file(sectionPath, xml);
+    }
+
+    if (newCharPrs.length > 0 && headerXml) {
+      const hasCharProperties = headerXml.includes('</hh:charProperties>');
+      if (hasCharProperties) {
+        headerXml = headerXml.replace(
+          /<hh:charProperties\s+itemCnt="(\d+)"/,
+          (_m: string, cnt: string) => `<hh:charProperties itemCnt="${parseInt(cnt, 10) + newCharPrs.length}"`
+        );
+        headerXml = headerXml.replace(
+          '</hh:charProperties>',
+          newCharPrs.join('\n') + '\n</hh:charProperties>'
+        );
+      } else {
+        const asCharShapes = newCharPrs.map(cp =>
+          cp.replace(/<hh:charPr\b/g, '<hh:charShape').replace(/<\/hh:charPr>/g, '</hh:charShape>')
+        );
+        headerXml = headerXml.replace(
+          /<hh:charShapeList\s+itemCnt="(\d+)"/,
+          (_m: string, cnt: string) => `<hh:charShapeList itemCnt="${parseInt(cnt, 10) + asCharShapes.length}"`
+        );
+        headerXml = headerXml.replace(
+          '</hh:charShapeList>',
+          asCharShapes.join('\n') + '\n</hh:charShapeList>'
+        );
+      }
+      this._zip.file('Contents/header.xml', headerXml);
+    }
+  }
+
+  /**
    * Apply table inserts to XML.
    * Inserts new tables into the section XML.
+   *
+   * @deprecated Retained for compatibility but no longer called from
+   * `syncContentToZip`. The unified `applyPendingInsertsToXml()` replaces
+   * both this and `applyParagraphInsertsToXml()` so paragraph+table inserts
+   * interleave correctly by insertOrder and respect nested-table wrappers.
    */
   private async applyTableInsertsToXml(): Promise<void> {
     if (!this._zip) return;
@@ -6190,6 +6594,8 @@ export class HwpxDocument {
       insertOrder: number;
       tableId: string;
       borderFillIDRef?: string;
+      overrideHeaderBorderFillIDRef?: string;
+      overrideBodyBorderFillIDRef?: string;
       overrideHeaderParaPrIDRef?: string;
       overrideHeaderCharPrIDRef?: string;
       overrideBodyParaPrIDRef?: string;
@@ -6210,6 +6616,8 @@ export class HwpxDocument {
         insertOrder: insert.insertOrder,
         tableId: insert.tableId,
         borderFillIDRef: insert.borderFillIDRef,
+        overrideHeaderBorderFillIDRef: insert.overrideHeaderBorderFillIDRef,
+        overrideBodyBorderFillIDRef: insert.overrideBodyBorderFillIDRef,
         overrideHeaderParaPrIDRef: insert.overrideHeaderParaPrIDRef,
         overrideHeaderCharPrIDRef: insert.overrideHeaderCharPrIDRef,
         overrideBodyParaPrIDRef: insert.overrideBodyParaPrIDRef,
@@ -6248,15 +6656,22 @@ export class HwpxDocument {
         const tableHeight = rowHeight * insert.rows;
 
         // Resolve style overrides (from preset resolution at the handler layer).
-        const borderFillRef = insert.borderFillIDRef ?? '2';
+        const defaultBorderFillRef = insert.borderFillIDRef ?? '2';
+        // Per-row borderFill lets the header carry a gray-fill variant (e.g.
+        // id="10" with <hc:winBrush faceColor="#E5E5E5"/>) while body cells
+        // use a plain-bordered white variant (e.g. id="9"). Falls back to the
+        // uniform borderFillRef when overrides aren't set.
+        const headerBorderRef = insert.overrideHeaderBorderFillIDRef ?? defaultBorderFillRef;
+        const bodyBorderRef   = insert.overrideBodyBorderFillIDRef   ?? defaultBorderFillRef;
         const headerParaRef = insert.overrideHeaderParaPrIDRef ?? '0';
         const headerCharRef = insert.overrideHeaderCharPrIDRef ?? '0';
         const bodyParaRef   = insert.overrideBodyParaPrIDRef   ?? '0';
         const bodyCharRef   = insert.overrideBodyCharPrIDRef   ?? '0';
         const hasHeaderRow = !!insert.headerCells && insert.headerCells.length > 0;
 
-        // Build table XML
-        let tableXml = `<hp:tbl id="${tableId}" zOrder="0" numberingType="TABLE" textWrap="TOP_AND_BOTTOM" textFlow="BOTH_SIDES" lock="0" dropcapstyle="None" pageBreak="CELL" repeatHeader="${hasHeaderRow ? 1 : 0}" rowCnt="${insert.rows}" colCnt="${insert.cols}" cellSpacing="0" borderFillIDRef="${borderFillRef}" noAdjust="0">`;
+        // Build table XML — the table-level borderFillIDRef is the body
+        // variant so inserting rows inherits the plain/white borderFill.
+        let tableXml = `<hp:tbl id="${tableId}" zOrder="0" numberingType="TABLE" textWrap="TOP_AND_BOTTOM" textFlow="BOTH_SIDES" lock="0" dropcapstyle="None" pageBreak="CELL" repeatHeader="${hasHeaderRow ? 1 : 0}" rowCnt="${insert.rows}" colCnt="${insert.cols}" cellSpacing="0" borderFillIDRef="${bodyBorderRef}" noAdjust="0">`;
         tableXml += `<hp:sz width="${insert.width}" widthRelTo="ABSOLUTE" height="${tableHeight}" heightRelTo="ABSOLUTE" protect="0"/>`;
         tableXml += `<hp:pos treatAsChar="1" affectLSpacing="0" flowWithText="1" allowOverlap="0" holdAnchorAndSO="0" vertRelTo="PARA" horzRelTo="PARA" vertAlign="TOP" horzAlign="LEFT" vertOffset="0" horzOffset="0"/>`;
         tableXml += `<hp:outMargin left="141" right="141" top="141" bottom="141"/>`;
@@ -6270,6 +6685,7 @@ export class HwpxDocument {
           const isHeaderRow = r === 0 && hasHeaderRow;
           const pRef = isHeaderRow ? headerParaRef : bodyParaRef;
           const cRef = isHeaderRow ? headerCharRef : bodyCharRef;
+          const rowBorderRef = isHeaderRow ? headerBorderRef : bodyBorderRef;
           tableXml += `<hp:tr>`;
           for (let c = 0; c < insert.cols; c++) {
             maxId++;
@@ -6286,7 +6702,7 @@ export class HwpxDocument {
               }
             }
             const escapedCellText = cellText ? this.escapeXml(cellText) : '';
-            tableXml += `<hp:tc name="" header="${isHeaderRow ? 1 : 0}" hasMargin="0" protect="0" editable="0" dirty="0" borderFillIDRef="${borderFillRef}">`;
+            tableXml += `<hp:tc name="" header="${isHeaderRow ? 1 : 0}" hasMargin="0" protect="0" editable="0" dirty="0" borderFillIDRef="${rowBorderRef}">`;
             tableXml += `<hp:subList id="" textDirection="HORIZONTAL" lineWrap="BREAK" vertAlign="CENTER" linkListIDRef="0" linkListNextIDRef="0" textWidth="0" textHeight="0" hasTextRef="0" hasNumRef="0">`;
             tableXml += `<hp:p id="${cellParaId}" paraPrIDRef="${pRef}" styleIDRef="0" pageBreak="0" columnBreak="0" merged="0">`;
             tableXml += `<hp:run charPrIDRef="${cRef}"><hp:t>${escapedCellText}</hp:t></hp:run>`;
@@ -6543,6 +6959,11 @@ export class HwpxDocument {
   /**
    * Apply paragraph inserts to XML.
    * Inserts new paragraphs at the specified positions.
+   *
+   * @deprecated Retained for compatibility but no longer called from
+   * `syncContentToZip`. The unified `applyPendingInsertsToXml()` replaces
+   * both this and `applyTableInsertsToXml()` so paragraph+table inserts
+   * interleave correctly by insertOrder and respect nested-table wrappers.
    */
   private async applyParagraphInsertsToXml(): Promise<void> {
     if (!this._zip) return;

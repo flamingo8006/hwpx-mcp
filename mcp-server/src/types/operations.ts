@@ -94,7 +94,16 @@ export interface PendingTableInsert {
   overrideBodyParaPrIDRef?: string;
   overrideBodyCharPrIDRef?: string;
   // Optional explicit borderFillIDRef; defaults to "2" (standard template value).
+  // Applied uniformly to every cell unless per-row overrides below are set.
   borderFillIDRef?: string;
+  // Per-row borderFill overrides (optional). When present, row 0 cells use
+  // `overrideHeaderBorderFillIDRef` and rows 1..n-1 use
+  // `overrideBodyBorderFillIDRef`. Lets the header carry a gray-fill borderFill
+  // (e.g. id="10" with <hc:winBrush faceColor="#E5E5E5"/>) while body cells use
+  // a plain-bordered white variant (e.g. id="9"). Falls back to `borderFillIDRef`
+  // for rows that don't have an override, which in turn falls back to "2".
+  overrideHeaderBorderFillIDRef?: string;
+  overrideBodyBorderFillIDRef?: string;
   // Header cell data (row 0) from build_document. When set, the first row is
   // populated with these texts and styled via header presets; subsequent rows
   // use body presets. When omitted (or fewer than cols), empty cells remain.
@@ -164,6 +173,14 @@ export interface PendingParagraphInsert {
   paragraphId: string;
   text: string;
   pageBreak?: boolean;
+  /**
+   * Monotonic counter shared with PendingTableInsert.insertOrder so paragraph
+   * and table inserts can be merged and applied to XML in a single pass, in
+   * the order the caller queued them. Required to fix the frame-template bug
+   * where tables were applied first (landing at `</hs:sec>` fallback) and
+   * paragraphs afterwards — which pushed tables to the top of the body.
+   */
+  insertOrder?: number;
   // Inline paragraph style (optional) — avoids separate set_paragraph_style call
   align?: string;
   marginLeft?: number;   // in pt

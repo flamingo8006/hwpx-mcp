@@ -176,6 +176,74 @@ describe('Template preset insertion (gongmun_v1)', () => {
     expect(header).toContain('<hh:charPr id="16"');
   });
 
+  it('insertTable per-row borderFillIDRef: header row gets override, body rows get body override', async () => {
+    const buf = fs.readFileSync(tmpPath);
+    const doc = await HwpxDocument.createFromBuffer('t-borderfill', tmpPath, buf);
+
+    doc.insertTable(0, 0, 3, 2, {
+      overrideHeaderParaPrIDRef: '31',
+      overrideHeaderCharPrIDRef: '29',
+      overrideBodyParaPrIDRef: '32',
+      overrideBodyCharPrIDRef: '30',
+      overrideHeaderBorderFillIDRef: '10', // gray-fill header
+      overrideBodyBorderFillIDRef: '9',    // white body
+      headerPreset: 'table_header',
+      bodyPreset: 'table_body',
+      headerCells: ['구분', '값'],
+      bodyCells: [
+        ['행1', '데이터1'],
+        ['행2', '데이터2'],
+      ],
+    });
+
+    const saved = await doc.save();
+    const z = await JSZip.loadAsync(saved);
+    const xml = await z.file('Contents/section0.xml')!.async('string');
+
+    const rows = xml.match(/<hp:tr>[\s\S]*?<\/hp:tr>/g)!;
+    expect(rows.length).toBe(3);
+
+    // Row 0 (header) — every <hp:tc> must carry borderFillIDRef="10".
+    const headerTcMatches = rows[0].match(/<hp:tc[^>]*borderFillIDRef="(\d+)"/g)!;
+    for (const tc of headerTcMatches) {
+      expect(tc).toContain('borderFillIDRef="10"');
+    }
+
+    // Rows 1..2 (body) — every <hp:tc> must carry borderFillIDRef="9".
+    for (let r = 1; r < rows.length; r++) {
+      const bodyTcMatches = rows[r].match(/<hp:tc[^>]*borderFillIDRef="(\d+)"/g)!;
+      for (const tc of bodyTcMatches) {
+        expect(tc).toContain('borderFillIDRef="9"');
+      }
+    }
+
+    // Table-level borderFillIDRef should fall back to the body value so that
+    // newly-inserted rows inherit the plain-white fill.
+    const tblMatch = xml.match(/<hp:tbl[^>]*borderFillIDRef="(\d+)"/)!;
+    expect(tblMatch[1]).toBe('9');
+  });
+
+  it('insertTable without per-row overrides applies the uniform borderFillIDRef to every cell', async () => {
+    const buf = fs.readFileSync(tmpPath);
+    const doc = await HwpxDocument.createFromBuffer('t-uniform', tmpPath, buf);
+
+    doc.insertTable(0, 0, 2, 2, {
+      borderFillIDRef: '2',
+      headerCells: ['H1', 'H2'],
+      bodyCells: [['B1', 'B2']],
+    });
+
+    const saved = await doc.save();
+    const z = await JSZip.loadAsync(saved);
+    const xml = await z.file('Contents/section0.xml')!.async('string');
+
+    const allTc = xml.match(/<hp:tc[^>]*borderFillIDRef="(\d+)"/g)!;
+    expect(allTc.length).toBe(4);
+    for (const tc of allTc) {
+      expect(tc).toContain('borderFillIDRef="2"');
+    }
+  });
+
   it('in-memory grid reflects headerCells/bodyCells before save', async () => {
     const buf = fs.readFileSync(tmpPath);
     const doc = await HwpxDocument.createFromBuffer('t5', tmpPath, buf);

@@ -5232,6 +5232,13 @@ Call get_tool_guide with: template, table, image, search, read, create`
               let overrideHeaderCharPrIDRef: string | undefined;
               let overrideBodyParaPrIDRef: string | undefined;
               let overrideBodyCharPrIDRef: string | undefined;
+              // Per-row borderFill overrides — lets the header preset apply a
+              // gray-filled borderFill (e.g. id="10") while the body preset
+              // uses a plain white one (e.g. id="9"). When only one preset
+              // supplies a borderFillIDRef, the other row defaults to the
+              // uniform `borderFillIDRef` fallback below.
+              let overrideHeaderBorderFillIDRef: string | undefined;
+              let overrideBodyBorderFillIDRef: string | undefined;
               let borderFillIDRef: string | undefined;
               if (headerPresetName || bodyPresetName) {
                 if (!activeProfile) {
@@ -5249,7 +5256,12 @@ Call get_tool_guide with: template, table, image, search, read, create`
                   }
                   overrideHeaderParaPrIDRef = h.paraPrIDRef;
                   overrideHeaderCharPrIDRef = h.charPrIDRef;
-                  if (h.borderFillIDRef) borderFillIDRef = h.borderFillIDRef;
+                  if (h.borderFillIDRef) {
+                    overrideHeaderBorderFillIDRef = h.borderFillIDRef;
+                    // Keep the legacy uniform hint in sync so single-row
+                    // (header-only) tables still paint correctly.
+                    borderFillIDRef = h.borderFillIDRef;
+                  }
                 }
                 if (bodyPresetName) {
                   const b = resolveTableCellPreset(activeProfile, bodyPresetName);
@@ -5261,7 +5273,13 @@ Call get_tool_guide with: template, table, image, search, read, create`
                   }
                   overrideBodyParaPrIDRef = b.paraPrIDRef;
                   overrideBodyCharPrIDRef = b.charPrIDRef;
-                  if (b.borderFillIDRef) borderFillIDRef = b.borderFillIDRef;
+                  if (b.borderFillIDRef) {
+                    overrideBodyBorderFillIDRef = b.borderFillIDRef;
+                    // When the body preset ships a borderFill, prefer it as
+                    // the uniform fallback — body rows dominate the table and
+                    // a plain (white) fill is the safe default.
+                    borderFillIDRef = b.borderFillIDRef;
+                  }
                 }
               }
 
@@ -5288,6 +5306,8 @@ Call get_tool_guide with: template, table, image, search, read, create`
                 overrideBodyParaPrIDRef,
                 overrideBodyCharPrIDRef,
                 borderFillIDRef,
+                overrideHeaderBorderFillIDRef,
+                overrideBodyBorderFillIDRef,
                 headerCells,
                 bodyCells,
               });
