@@ -1230,7 +1230,7 @@ export class HwpxParser {
     cleanedXml = cleanedXml.replace(/<hp:footNote\b[^>]*>[\s\S]*?<\/hp:footNote>/gi, '');
     cleanedXml = cleanedXml.replace(/<hp:endNote\b[^>]*>[\s\S]*?<\/hp:endNote>/gi, '');
 
-    const elements: { index: number; type: string; xml: string; parentLinesegs?: import('./types').LineSeg[]; originalXmlPosition?: { start: number; end: number } }[] = [];
+    const elements: { index: number; type: string; xml: string; parentLinesegs?: import('./types').LineSeg[]; originalXmlPosition?: { start: number; end: number }; wrapsTable?: boolean; isNestedInWrapper?: boolean }[] = [];
 
     // Extract ALL paragraphs first to find parent paragraphs for tables
     const paragraphs = this.extractAllParagraphs(cleanedXml);
@@ -1354,8 +1354,25 @@ export class HwpxParser {
           // Only add if there's remaining content besides lineseg
           const hasTextContent = /<hp:t\b[^>]*>/.test(paraXmlWithoutTable);
           if (hasTextContent) {
-            elements.push({ index: para.start, type: 'p', xml: paraXmlWithoutTable, originalXmlPosition: origPos });
+            // Mark this wrapper paragraph as containing a nested table. The
+            // save-time walker in HwpxDocument absorbs the nested <hp:tbl>
+            // into the wrapper's <hp:p>...</hp:p> span, so insert-position
+            // translation must skip the separate nested-tbl mem element.
+            elements.push({ index: para.start, type: 'p', xml: paraXmlWithoutTable, originalXmlPosition: origPos, wrapsTable: true });
             originalParaIndex++;
+
+            // Flag all table elements that fall inside this wrapper's XML
+            // range as nested — this is what `computeWalkerTargetIndex` uses
+            // to skip them (more reliable than the "prev mem entry is
+            // wrapsTable" heuristic, which breaks if a single wrapper
+            // contains multiple nested tables).
+            const wrapperStart = para.start;
+            const wrapperEnd = para.start + para.xml.length;
+            for (const el of elements) {
+              if (el.type === 'tbl' && el.index >= wrapperStart && el.index < wrapperEnd) {
+                el.isNestedInWrapper = true;
+              }
+            }
           }
         } else {
           elements.push({ index: para.start, type: 'p', xml: para.xml, originalXmlPosition: origPos });
@@ -1524,6 +1541,13 @@ export class HwpxParser {
           };
         }
 
+        // Propagate wrapsTable flag (set when this paragraph's XML contains a
+        // nested <hp:tbl>) so insert-position logic can skip the nested-tbl
+        // mem element when translating mem→walker indices at save time.
+        if (el.wrapsTable) {
+          paragraph.wrapsTable = true;
+        }
+
         // Check if this paragraph should have a footnote reference
         // (footnote was in original XML but removed from cleanedXml)
         for (const fnRef of footnoteRefPositions) {
@@ -1551,6 +1575,11 @@ export class HwpxParser {
         // Add parent paragraph's lineseg info to table for page break detection
         if (el.parentLinesegs && el.parentLinesegs.length > 0) {
           table.linesegs = el.parentLinesegs;
+        }
+        // Propagate nested-in-wrapper flag so save-time index translation
+        // can skip this table (see `computeWalkerTargetIndex`).
+        if (el.isNestedInWrapper) {
+          table.isNestedInWrapper = true;
         }
         section.elements.push({ type: 'table', data: table });
       } else if (el.type === 'pic') {

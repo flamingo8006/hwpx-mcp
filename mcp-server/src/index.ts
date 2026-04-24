@@ -28,6 +28,14 @@ function expandPath(p: string | undefined): string | undefined {
   return expanded;
 }
 import { HangingIndentCalculator } from './HangingIndentCalculator';
+import {
+  getTemplateProfile,
+  listTemplateProfiles,
+  verifyProfileAgainstHeader,
+  resolveParagraphPreset,
+  resolveTableCellPreset,
+  computeStylePaletteFingerprint,
+} from './TemplateProfiles';
 
 // Version marker for debugging
 const MCP_VERSION = 'v2-fixed-xml-replacement';
@@ -2273,27 +2281,51 @@ Use after finding a position in the index to get the full chunk context.`,
     name: 'build_document',
     description: `⭐ Build an entire document body in a SINGLE call. Instead of calling insert_paragraph 30+ times, pass all elements (paragraphs and tables) at once.
 
-Each element can be:
-- paragraph: text with optional inline styles (bold, font_size, align, margin_left, etc.)
-- table: rows/cols with optional header styling and cell data (2D array)
+TWO MODES:
+(1) Free-form — inline styles per element (bold/font_size/align/margin_*/line_spacing).
+(2) Template-styled — pass \`template_profile\` + per-element \`preset\` to reuse
+    paraPrIDRef/charPrIDRef already defined in the document's header.xml. This
+    mode ignores inline style fields so the result matches the template
+    exactly, with no post-processing required.
 
-Example:
+Template mode (gongmun_v1 example):
 build_document({
-  doc_id: "...",
+  doc_id,
+  template_profile: "gongmun_v1",
+  after_index: 7,
   elements: [
-    { type: "paragraph", text: "제목", align: "center", bold: true, font_size: 20 },
-    { type: "paragraph", text: "1. 본문", bold: true, font_size: 16 },
-    { type: "table", rows: 3, cols: 2, header_bg_color: "404040", header_font_color: "FFFFFF",
-      data: [["구분", "내용"], ["항목1", "값1"], ["항목2", "값2"]] },
-    { type: "paragraph", text: "ㅇ 설명 텍스트", font_size: 11, margin_left: 8 }
+    { type: "paragraph", text: "□ 추진 배경", preset: "heading" },
+    { type: "paragraph", text: " ㅇ 2025년 대비 교육 니즈 확대", preset: "point" },
+    { type: "paragraph", text: "  - 바이브 코딩·노코드 수요 급증", preset: "detail" },
+    { type: "table", rows: 5, cols: 3,
+      header_preset: "table_header", body_preset: "table_body",
+      data: [
+        ["차수","교육 주제","시간·정원"],
+        ["1차","AI 기초","3H·40명"], ...
+      ] }
   ]
-})`,
+})
+
+Built-in profiles:
+- gongmun_v1  — DGIST 공문서_프레임.hwpx. Presets:
+    title, date, summary, heading, point, detail, subdetail, footnote,
+    table_title, table_unit, table_note
+    (table cell presets: table_header, table_body)
+
+When \`template_profile\` is supplied the server fingerprints the document's
+header.xml style palette and validates preset-relevant entries. If the opened
+document does not actually carry the profile's style palette, the call fails
+fast with a descriptive error so no wrong-styled content lands in the file.`,
     inputSchema: {
       type: 'object',
       properties: {
         doc_id: { type: 'string', description: 'Document ID' },
         section_index: { type: 'number', description: 'Section index (default: 0)' },
         after_index: { type: 'number', description: 'Insert after this element index. Omit to append at end. -1 for beginning.' },
+        template_profile: {
+          type: 'string',
+          description: 'Optional template profile name (e.g. "gongmun_v1"). When set, each element may use `preset`/`header_preset`/`body_preset` to reference the profile\'s paraPrIDRef+charPrIDRef pairs. Inline style fields are ignored for elements with a resolved preset.',
+        },
         elements: {
           type: 'array',
           description: 'Array of elements to insert (paragraphs and tables)',
@@ -2301,7 +2333,9 @@ build_document({
             type: 'object',
             properties: {
               type: { type: 'string', enum: ['paragraph', 'table'], description: 'Element type' },
-              // Paragraph properties
+              // Template preset (paragraph)
+              preset: { type: 'string', description: 'Template preset name (paragraph only). Requires template_profile; resolves to template\'s paraPrIDRef+charPrIDRef pair. Inline styles ignored when preset resolves.' },
+              // Paragraph properties (free-form mode, ignored when preset is set)
               text: { type: 'string', description: 'Paragraph text' },
               align: { type: 'string', enum: ['left', 'center', 'right', 'justify', 'distribute'], description: 'Text alignment' },
               bold: { type: 'boolean', description: 'Bold' },
@@ -2318,16 +2352,26 @@ build_document({
               rows: { type: 'number', description: 'Number of rows (table only)' },
               cols: { type: 'number', description: 'Number of columns (table only)' },
               col_widths: { type: 'array', items: { type: 'number' }, description: 'Column widths in hwpunit (table only)' },
-              header_bg_color: { type: 'string', description: 'Header row background color hex (table only)' },
-              header_font_color: { type: 'string', description: 'Header row text color hex (table only)' },
-              header_align: { type: 'string', enum: ['left', 'center', 'right'], description: 'Header row text alignment (default: center when header_bg_color is set)' },
-              data: { type: 'array', items: { type: 'array', items: { type: 'string' } }, description: '2D array of cell text (table only)' },
+              header_bg_color: { type: 'string', description: 'Header row background color hex (table only; free-form mode)' },
+              header_font_color: { type: 'string', description: 'Header row text color hex (table only; free-form mode)' },
+              header_align: { type: 'string', enum: ['left', 'center', 'right'], description: 'Header row text alignment (free-form mode)' },
+              header_preset: { type: 'string', description: 'Template cell preset for row 0 (e.g. "table_header"). Requires template_profile.' },
+              body_preset: { type: 'string', description: 'Template cell preset for rows 1..n-1 (e.g. "table_body"). Requires template_profile.' },
+              data: { type: 'array', items: { type: 'array', items: { type: 'string' } }, description: '2D array of cell text (table only). Row 0 is treated as the header row.' },
             },
             required: ['type'],
           },
         },
       },
       required: ['doc_id', 'elements'],
+    },
+  },
+  {
+    name: 'list_template_profiles',
+    description: 'List all built-in template profiles and their preset catalogs. Use this to discover what presets build_document accepts for each profile.',
+    inputSchema: {
+      type: 'object',
+      properties: {},
     },
   },
   {
@@ -5045,6 +5089,41 @@ Call get_tool_guide with: template, table, image, search, read, create`
           return error('elements array is required and must not be empty');
         }
 
+        // ---- Template profile resolution (fail-closed) ----
+        //
+        // When the caller passes `template_profile`, we load the profile, read
+        // the document's header.xml, and verify every assertion before any
+        // element is inserted. A mismatch aborts the whole call so no
+        // wrong-styled content ever lands in the file. Profile-less calls
+        // skip all this and behave like before (free-form).
+        const profileName = args?.template_profile as string | undefined;
+        let activeProfile: ReturnType<typeof getTemplateProfile> = undefined;
+        let profileFingerprint: string | undefined;
+        if (profileName) {
+          activeProfile = getTemplateProfile(profileName);
+          if (!activeProfile) {
+            const available = listTemplateProfiles().map(p => p.name).join(', ');
+            return error(`Unknown template_profile "${profileName}". Available: ${available || '(none)'}`);
+          }
+          const headerXml = await doc.getHeaderXml();
+          if (!headerXml) {
+            return error(
+              `template_profile "${profileName}" requires an opened template document ` +
+              `with Contents/header.xml; this document has no header (likely created via create_document). ` +
+              `Open the template file instead.`,
+            );
+          }
+          const check = verifyProfileAgainstHeader(activeProfile, headerXml);
+          if (!check.ok) {
+            return error(
+              `template_profile "${profileName}" does not match this document's style palette. ` +
+              `Failures: ${check.failures.join('; ')}. ` +
+              `Open the correct template (e.g. 공문서_프레임.hwpx for gongmun_v1) or omit template_profile.`,
+            );
+          }
+          profileFingerprint = computeStylePaletteFingerprint(headerXml);
+        }
+
         // Determine starting insertion point
         let currentIndex: number;
         if (args?.after_index !== undefined) {
@@ -5064,34 +5143,68 @@ Call get_tool_guide with: template, table, image, search, read, create`
             if (el.type === 'paragraph') {
               const text = el.text ?? '';
 
-              // Pass char style directly to insertParagraph so that
-              // applyParagraphInsertsToXml creates the correct charPrIDRef
-              // in a single step, avoiding the element index mismatch bug.
-              const charStyle: any = {
+              // Template-preset branch: resolve preset → override IDs. Inline
+              // style fields (bold/font_size/...) are ignored so the output
+              // exactly matches the template's paraPr/charPr.
+              let overrideParaPrIDRef: string | undefined;
+              let overrideCharPrIDRef: string | undefined;
+              const presetName = el.preset as string | undefined;
+              if (presetName) {
+                if (!activeProfile) {
+                  buildFailed = true;
+                  results.push({ index: i, type: 'paragraph', success: false, error: `preset "${presetName}" requires template_profile` });
+                  break;
+                }
+                const preset = resolveParagraphPreset(activeProfile, presetName);
+                if (!preset) {
+                  const available = Object.keys(activeProfile.presets).join(', ');
+                  buildFailed = true;
+                  results.push({ index: i, type: 'paragraph', success: false, error: `Unknown preset "${presetName}" for profile "${activeProfile.name}". Available: ${available}` });
+                  break;
+                }
+                overrideParaPrIDRef = preset.paraPrIDRef;
+                overrideCharPrIDRef = preset.charPrIDRef;
+              }
+
+              // Inline char style only used when no preset override.
+              const charStyle: any = overrideCharPrIDRef === undefined ? {
                 bold: el.bold ?? false,
                 italic: el.italic ?? false,
                 underline: el.underline ?? false,
-              };
-              if (el.font_size) charStyle.fontSize = el.font_size;
-              if (el.font_color) charStyle.fontColor = el.font_color;
+              } : undefined;
+              if (charStyle) {
+                if (el.font_size) charStyle.fontSize = el.font_size;
+                if (el.font_color) charStyle.fontColor = el.font_color;
+              }
 
-              const idx = doc.insertParagraph(sectionIndex, currentIndex, text, charStyle);
+              const idx = doc.insertParagraph(
+                sectionIndex,
+                currentIndex,
+                text,
+                charStyle,
+                overrideParaPrIDRef || overrideCharPrIDRef
+                  ? { overrideParaPrIDRef, overrideCharPrIDRef, preset: presetName }
+                  : undefined,
+              );
               if (idx === -1) {
                 buildFailed = true;
                 results.push({ index: i, type: 'paragraph', success: false, error: 'Insert failed' });
                 break;
               }
 
-              // Apply paragraph style
-              const pStyle: any = {};
-              if (el.align) pStyle.align = el.align;
-              if (el.margin_left) pStyle.marginLeft = el.margin_left;
-              if (el.margin_right) pStyle.marginRight = el.margin_right;
-              if (el.margin_top) pStyle.marginTop = el.margin_top;
-              if (el.margin_bottom) pStyle.marginBottom = el.margin_bottom;
-              if (el.line_spacing) pStyle.lineSpacing = el.line_spacing;
-              if (Object.keys(pStyle).length > 0) {
-                doc.applyParagraphStyle(sectionIndex, idx, pStyle);
+              // Apply paragraph style — skipped when preset override present
+              // so template paraPr isn't overwritten by inline margins/align.
+              if (overrideParaPrIDRef === undefined) {
+                const pStyle: any = {};
+                if (el.align) pStyle.align = el.align;
+                if (el.margin_left) pStyle.marginLeft = el.margin_left;
+                if (el.margin_right) pStyle.marginRight = el.margin_right;
+                if (el.margin_top) pStyle.marginTop = el.margin_top;
+                if (el.margin_bottom) pStyle.marginBottom = el.margin_bottom;
+                if (el.line_spacing) pStyle.lineSpacing = el.line_spacing;
+                if (Object.keys(pStyle).length > 0) {
+                  doc.applyParagraphStyle(sectionIndex, idx, pStyle);
+                }
               }
 
               // Flush to XML so subsequent indices are correct
@@ -5099,7 +5212,9 @@ Call get_tool_guide with: template, table, image, search, read, create`
 
               currentIndex = idx;
               paragraphCount++;
-              results.push({ index: i, type: 'paragraph', success: true, element_index: idx });
+              const pResult: any = { index: i, type: 'paragraph', success: true, element_index: idx };
+              if (presetName) pResult.preset = presetName;
+              results.push(pResult);
 
             } else if (el.type === 'table') {
               const rows = el.rows as number;
@@ -5110,9 +5225,91 @@ Call get_tool_guide with: template, table, image, search, read, create`
                 break;
               }
 
+              // Resolve table cell presets if profile is active.
+              const headerPresetName = el.header_preset as string | undefined;
+              const bodyPresetName = el.body_preset as string | undefined;
+              let overrideHeaderParaPrIDRef: string | undefined;
+              let overrideHeaderCharPrIDRef: string | undefined;
+              let overrideBodyParaPrIDRef: string | undefined;
+              let overrideBodyCharPrIDRef: string | undefined;
+              // Per-row borderFill overrides — lets the header preset apply a
+              // gray-filled borderFill (e.g. id="10") while the body preset
+              // uses a plain white one (e.g. id="9"). When only one preset
+              // supplies a borderFillIDRef, the other row defaults to the
+              // uniform `borderFillIDRef` fallback below.
+              let overrideHeaderBorderFillIDRef: string | undefined;
+              let overrideBodyBorderFillIDRef: string | undefined;
+              let borderFillIDRef: string | undefined;
+              if (headerPresetName || bodyPresetName) {
+                if (!activeProfile) {
+                  buildFailed = true;
+                  results.push({ index: i, type: 'table', success: false, error: 'table cell presets require template_profile' });
+                  break;
+                }
+                if (headerPresetName) {
+                  const h = resolveTableCellPreset(activeProfile, headerPresetName);
+                  if (!h) {
+                    const available = Object.keys(activeProfile.tableCellPresets).join(', ');
+                    buildFailed = true;
+                    results.push({ index: i, type: 'table', success: false, error: `Unknown header_preset "${headerPresetName}". Available: ${available}` });
+                    break;
+                  }
+                  overrideHeaderParaPrIDRef = h.paraPrIDRef;
+                  overrideHeaderCharPrIDRef = h.charPrIDRef;
+                  if (h.borderFillIDRef) {
+                    overrideHeaderBorderFillIDRef = h.borderFillIDRef;
+                    // Keep the legacy uniform hint in sync so single-row
+                    // (header-only) tables still paint correctly.
+                    borderFillIDRef = h.borderFillIDRef;
+                  }
+                }
+                if (bodyPresetName) {
+                  const b = resolveTableCellPreset(activeProfile, bodyPresetName);
+                  if (!b) {
+                    const available = Object.keys(activeProfile.tableCellPresets).join(', ');
+                    buildFailed = true;
+                    results.push({ index: i, type: 'table', success: false, error: `Unknown body_preset "${bodyPresetName}". Available: ${available}` });
+                    break;
+                  }
+                  overrideBodyParaPrIDRef = b.paraPrIDRef;
+                  overrideBodyCharPrIDRef = b.charPrIDRef;
+                  if (b.borderFillIDRef) {
+                    overrideBodyBorderFillIDRef = b.borderFillIDRef;
+                    // When the body preset ships a borderFill, prefer it as
+                    // the uniform fallback — body rows dominate the table and
+                    // a plain (white) fill is the safe default.
+                    borderFillIDRef = b.borderFillIDRef;
+                  }
+                }
+              }
+
+              // Split el.data into headerCells / bodyCells when presets set.
+              // With no presets we fall back to the legacy post-fill loop
+              // below so free-form tables keep their prior behavior.
+              const hasPreset = overrideHeaderParaPrIDRef !== undefined || overrideBodyParaPrIDRef !== undefined;
+              let headerCells: string[] | undefined;
+              let bodyCells: string[][] | undefined;
+              if (hasPreset && el.data && Array.isArray(el.data) && el.data.length > 0) {
+                headerCells = (el.data[0] || []).map((v: any) => (v == null ? '' : String(v)));
+                bodyCells = el.data.slice(1).map((row: any[]) =>
+                  (row || []).map(v => (v == null ? '' : String(v))),
+                );
+              }
+
               const tableResult = doc.insertTable(sectionIndex, currentIndex, rows, cols, {
                 width: el.width as number | undefined,
                 colWidths: el.col_widths as number[] | undefined,
+                headerPreset: headerPresetName,
+                bodyPreset: bodyPresetName,
+                overrideHeaderParaPrIDRef,
+                overrideHeaderCharPrIDRef,
+                overrideBodyParaPrIDRef,
+                overrideBodyCharPrIDRef,
+                borderFillIDRef,
+                overrideHeaderBorderFillIDRef,
+                overrideBodyBorderFillIDRef,
+                headerCells,
+                bodyCells,
               });
               if (!tableResult) {
                 buildFailed = true;
@@ -5122,41 +5319,48 @@ Call get_tool_guide with: template, table, image, search, read, create`
 
               const tblIdx = tableResult.tableIndex;
 
-              // Fill cell data FIRST, then apply header style AFTER
-              if (el.data && Array.isArray(el.data)) {
-                for (let r = 0; r < el.data.length && r < rows; r++) {
-                  const row = el.data[r];
-                  if (!Array.isArray(row)) continue;
-                  for (let c = 0; c < row.length && c < cols; c++) {
-                    if (row[c] !== undefined && row[c] !== null) {
-                      doc.updateTableCell(sectionIndex, tblIdx, r, c, String(row[c]));
+              // Legacy free-form branch: fill cell data + manual header styling.
+              // Skipped when presets are in use (data was passed via headerCells/
+              // bodyCells and styling comes from the preset).
+              if (!hasPreset) {
+                if (el.data && Array.isArray(el.data)) {
+                  for (let r = 0; r < el.data.length && r < rows; r++) {
+                    const row = el.data[r];
+                    if (!Array.isArray(row)) continue;
+                    for (let c = 0; c < row.length && c < cols; c++) {
+                      if (row[c] !== undefined && row[c] !== null) {
+                        doc.updateTableCell(sectionIndex, tblIdx, r, c, String(row[c]));
+                      }
                     }
                   }
                 }
-              }
 
-              // Style header row AFTER data fill
-              if (el.header_bg_color) {
-                for (let c = 0; c < cols; c++) {
-                  doc.setCellBackgroundColor(sectionIndex, tblIdx, 0, c, el.header_bg_color);
-                  const hStyle: any = { bold: true };
-                  if (el.header_font_color) hStyle.fontColor = el.header_font_color;
-                  doc.applyTableCellCharacterStyle(sectionIndex, tblIdx, 0, c, 0, 0, hStyle);
+                if (el.header_bg_color) {
+                  for (let c = 0; c < cols; c++) {
+                    doc.setCellBackgroundColor(sectionIndex, tblIdx, 0, c, el.header_bg_color);
+                    const hStyle: any = { bold: true };
+                    if (el.header_font_color) hStyle.fontColor = el.header_font_color;
+                    doc.applyTableCellCharacterStyle(sectionIndex, tblIdx, 0, c, 0, 0, hStyle);
+                  }
                 }
               }
 
               // Flush to XML so subsequent indices are correct
               await doc.flushPendingToXml();
 
-              // Apply header alignment after flush (requires table to exist in XML)
-              if (el.header_bg_color || el.header_align) {
+              // Apply header alignment after flush (free-form only — preset
+              // branch relies on the cell paraPr for alignment).
+              if (!hasPreset && (el.header_bg_color || el.header_align)) {
                 const headerAlign = el.header_align as string || 'center';
                 await doc.setTableCellAlignmentInXml(sectionIndex, tblIdx, [0], cols, headerAlign);
               }
 
               currentIndex = currentIndex + 1;
               tableCount++;
-              results.push({ index: i, type: 'table', success: true, table_index: tblIdx });
+              const tResult: any = { index: i, type: 'table', success: true, table_index: tblIdx };
+              if (headerPresetName) tResult.header_preset = headerPresetName;
+              if (bodyPresetName) tResult.body_preset = bodyPresetName;
+              results.push(tResult);
             }
           }
         } catch (e: any) {
@@ -5173,13 +5377,42 @@ Call get_tool_guide with: template, table, image, search, read, create`
           return error(`Build failed at element ${results.length - 1}. ${succeeded} elements were inserted before failure. Use close_document to discard, or save_document to keep partial results. Error: ${JSON.stringify(failed)}`);
         }
 
-        return success({
+        const payload: any = {
           message: `Built ${paragraphCount} paragraphs, ${tableCount} tables`,
           paragraphs: paragraphCount,
           tables: tableCount,
           total: paragraphCount + tableCount,
           results,
-        });
+        };
+        if (activeProfile) {
+          payload.template_profile = activeProfile.name;
+          payload.style_palette_fingerprint = profileFingerprint;
+        }
+        return success(payload);
+      }
+
+      case 'list_template_profiles': {
+        const profiles = listTemplateProfiles().map(p => ({
+          name: p.name,
+          description: p.description,
+          paragraph_presets: Object.fromEntries(
+            Object.entries(p.presets).map(([k, v]) => [k, {
+              paraPrIDRef: v.paraPrIDRef,
+              charPrIDRef: v.charPrIDRef,
+              description: v.description,
+            }]),
+          ),
+          table_cell_presets: Object.fromEntries(
+            Object.entries(p.tableCellPresets).map(([k, v]) => [k, {
+              paraPrIDRef: v.paraPrIDRef,
+              charPrIDRef: v.charPrIDRef,
+              borderFillIDRef: v.borderFillIDRef,
+              description: v.description,
+            }]),
+          ),
+          assertion_count: p.assertions.length,
+        }));
+        return success({ profiles });
       }
 
       default:
