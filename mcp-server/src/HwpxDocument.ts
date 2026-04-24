@@ -6165,10 +6165,53 @@ export class HwpxDocument {
         const closeTag = `</${prefix}:${tagType}>`;
 
         if (tagType === 'p') {
-          // Paragraphs: find matching close tag
-          const closeIdx = xml.indexOf(closeTag, elem.start);
-          if (closeIdx === -1) continue;
-          xml = xml.slice(0, elem.start) + xml.slice(closeIdx + closeTag.length);
+          // Paragraphs: depth-aware search so wrapper <hp:p> elements that
+          // contain a nested <hp:tbl> (wrapsTable) match their own </hp:p>
+          // rather than the first </hp:p> inside a nested table cell.
+          const openPrefix = `<${prefix}:p`;
+          let depth = 1;
+          let pos = elem.start + elem.tagLength;
+          while (depth > 0 && pos < xml.length) {
+            const nextClose = xml.indexOf(closeTag, pos);
+            if (nextClose === -1) break;
+            // Find the next <prefix:p open (boundary: space/tab/newline, '>',
+            // or '/'), skipping <hp:pic>/<hp:pos>/<hp:pageNum>/etc and
+            // self-closing <hp:p .../> tokens (they don't change depth).
+            let nextOpen = -1;
+            let scan = pos;
+            while (scan < nextClose) {
+              const candidate = xml.indexOf(openPrefix, scan);
+              if (candidate === -1 || candidate >= nextClose) break;
+              const afterIdx = candidate + openPrefix.length;
+              const afterChar = xml.charCodeAt(afterIdx);
+              const isBoundary =
+                afterChar === 32 /* space */ || afterChar === 9 /* tab */ ||
+                afterChar === 10 /* LF */ || afterChar === 13 /* CR */ ||
+                afterChar === 62 /* > */ || afterChar === 47 /* / */;
+              if (!isBoundary) {
+                scan = candidate + 1;
+                continue;
+              }
+              const tagEnd = xml.indexOf('>', candidate);
+              if (tagEnd !== -1 && tagEnd < nextClose && xml[tagEnd - 1] === '/') {
+                // self-closing <hp:p .../> — skip over without depth change
+                scan = tagEnd + 1;
+                continue;
+              }
+              nextOpen = candidate;
+              break;
+            }
+            if (nextOpen !== -1 && nextOpen < nextClose) {
+              depth++;
+              pos = nextOpen + openPrefix.length;
+            } else {
+              depth--;
+              if (depth === 0) {
+                xml = xml.slice(0, elem.start) + xml.slice(nextClose + closeTag.length);
+              }
+              pos = nextClose + closeTag.length;
+            }
+          }
         } else {
           // Tables: use depth-aware search for proper nesting
           const openTag = `<${prefix}:tbl`;
