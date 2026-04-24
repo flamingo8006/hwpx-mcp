@@ -28,6 +28,7 @@ function expandPath(p: string | undefined): string | undefined {
   return expanded;
 }
 import { HangingIndentCalculator } from './HangingIndentCalculator';
+import { collectUserPaths } from './UserPaths';
 import {
   getTemplateProfile,
   listTemplateProfiles,
@@ -2369,6 +2370,22 @@ fast with a descriptive error so no wrong-styled content lands in the file.`,
   {
     name: 'list_template_profiles',
     description: 'List all built-in template profiles and their preset catalogs. Use this to discover what presets build_document accepts for each profile.',
+    inputSchema: {
+      type: 'object',
+      properties: {},
+    },
+  },
+  {
+    name: 'get_user_paths',
+    description: `Return absolute paths on the **user's local machine** (home, Documents, Downloads, skills/templates) plus a list of HWPX templates that are actually present on disk.
+
+Call this INSTEAD of running Bash \`echo $HOME\` / \`cmd /c echo %USERPROFILE%\` whenever a skill needs to locate user files. The MCP server runs under the user's own OS account, so the values it returns reflect the real filesystem — whereas a skill's Bash tool may execute inside a sandboxed container where \`$HOME\` is \`/root\` and the user's files are invisible.
+
+Typical usage from a skill:
+1. Call \`get_user_paths\`.
+2. Check \`templates[]\` for the filename you need (e.g. \`공문서_프레임.hwpx\`).
+3. Pass \`templates[i].path\` to \`open_document({ file_path: ... })\`.
+4. Build output filenames by joining \`downloads\` with your desired basename.`,
     inputSchema: {
       type: 'object',
       properties: {},
@@ -5413,6 +5430,10 @@ Call get_tool_guide with: template, table, image, search, read, create`
           assertion_count: p.assertions.length,
         }));
         return success({ profiles });
+      }
+
+      case 'get_user_paths': {
+        return success(collectUserPaths());
       }
 
       default:

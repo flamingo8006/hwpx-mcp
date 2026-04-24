@@ -4,14 +4,6 @@ description: HWPX 한글 문서를 3개 모드로 작성하는 스킬. 사용자
 model: sonnet
 allowed-tools:
   - mcp__hwpx__*
-  - Bash(uname:*)
-  - Bash(echo:*)
-  - Bash(cmd:*)
-  - Bash(ls:*)
-  - Bash(dir:*)
-  - Bash(cp:*)
-  - Bash(copy:*)
-  - Bash(mkdir:*)
   - Read
 ---
 
@@ -19,45 +11,37 @@ allowed-tools:
 
 ## Step 0 (모든 작업 공통 — 절대 건너뛰지 말 것)
 
-OS 감지 + 템플릿 디렉터리 확인을 **첫 번째로** 1회 수행. 이후 같은 값 재사용 (중복 조회 금지).
+**첫 번째로 정확히 한 번** `mcp__hwpx__get_user_paths` 를 호출해 사용자 PC 의 실제 경로를 확보. 결과를 `$PATHS` 로 저장하고 이후 같은 값 재사용 (중복 조회 금지).
 
-### ① OS + 홈 경로 확보 (Bash 1회)
+> ⚠️ **Bash `echo $HOME` / `uname` / `dir` 같은 셸 명령으로 OS·HOME 을 추측하지 말 것.** Claude Desktop 환경에서 Bash 는 샌드박스 리눅스 컨테이너에서 실행돼 `$HOME=/root` 을 반환하며, 사용자의 실제 Windows/macOS 파일은 보이지 않는다. `get_user_paths` 는 MCP 서버(사용자 OS 계정에서 실행)가 돌려주는 **진짜** 경로다.
 
-**macOS/Linux 시도**:
-```bash
-uname 2>/dev/null && echo "$HOME"
-```
-- 출력 예시: `Darwin` 그 다음 줄 `/Users/flamingo` → macOS, HOME = `/Users/flamingo`
-- `uname` 자체가 실패/없으면 → Windows 분기
+### get_user_paths 반환 예시
 
-**Windows 분기 (macOS/Linux 실패 시)**:
-```bash
-cmd /c "echo %USERPROFILE%"
-```
-- 출력 예시: `C:\Users\홍길동` → Windows, USERPROFILE = `C:\Users\홍길동`
-
-### ② TEMPLATE_DIR 확정 (고정 경로만 허용)
-
-- **macOS/Linux**: `<HOME>/Documents/skills/templates/`
-- **Windows**: `<USERPROFILE>\Documents\skills\templates\`
-
-> **절대 다른 경로 탐색 금지.** 공용 문서(`C:\Users\Public\Documents`), 다른 드라이브, 임의 폴더 시도 안 함. 위 경로에 파일이 없으면 **즉시 Mode C (자유 작성) 폴백**.
-
-### ③ 필요한 템플릿 존재 확인
-
-**macOS/Linux**:
-```bash
-ls "<TEMPLATE_DIR><파일명>.hwpx" 2>/dev/null
+```json
+{
+  "os": "win32",                          // "darwin" / "win32" / "linux"
+  "username": "<username>",
+  "home": "C:\\Users\\<username>",
+  "documents": "C:\\Users\\<username>\\Documents",
+  "downloads": "C:\\Users\\<username>\\Downloads",
+  "templates_dir": "C:\\Users\\<username>\\Documents\\skills\\templates",
+  "templates_dir_exists": true,
+  "templates": [
+    { "filename": "공문서_프레임.hwpx",
+      "path": "C:\\Users\\<username>\\Documents\\skills\\templates\\공문서_프레임.hwpx",
+      "size": 32772 }
+  ]
+}
 ```
 
-**Windows**:
-```bash
-cmd /c "dir \"<TEMPLATE_DIR><파일명>.hwpx\"" 2>nul
-```
+### 템플릿 선택 규칙
 
-- **존재** → 해당 모드 (A 또는 B) 진행
-- **없음** → 즉시 Mode C 로 폴백 + 사용자에게 1줄 고지:
-  > "⚠️ 템플릿(`<파일명>.hwpx`)이 `<TEMPLATE_DIR>`에 없어 자유 작성 모드로 진행합니다."
+1. 모드 판정(아래 "모드 선택" 표) 후, 필요한 템플릿 파일명을 결정 (`공문서_프레임.hwpx` / `업무추진비_집행내역서.hwpx`).
+2. `$PATHS.templates` 배열을 순회하며 `filename` 이 일치하는 엔트리 탐색 → 있으면 `.path` 를 절대경로로 사용.
+3. 일치하는 엔트리가 없으면 **즉시 Mode C (자유 작성) 폴백** + 사용자에게 1줄 고지:
+   > "⚠️ 템플릿(`<파일명>`)이 `<templates_dir>` 에 없어 자유 작성 모드로 진행합니다."
+
+> **다른 경로 탐색 금지.** `$PATHS.templates_dir` 외의 폴더(`C:\Users\Public\...`, 다른 드라이브, 임의 폴더)는 시도하지 않는다. 없으면 없는 것.
 
 ---
 
@@ -75,12 +59,11 @@ cmd /c "dir \"<TEMPLATE_DIR><파일명>.hwpx\"" 2>nul
 
 ## Mode A — 폼필
 
-**흐름** (MCP 5회):
-1. Bash: `cp <TEMPLATE_DIR>업무추진비_집행내역서.hwpx <HOME>/Downloads/<자동파일명>.hwpx`
-2. `open_document({ file_path: <복사본 절대경로> })` → `{ doc_id }`
-3. `batch_replace({ doc_id, replacements: [ /* 14개 placeholder 전부 */ ] })`
-4. `save_document`
-5. `close_document`
+**흐름** (MCP 4회 — Bash 불필요):
+1. `open_document({ file_path: <templates[i].path> })` → `{ doc_id }`  — 템플릿을 직접 연다 (원본은 save 시점에 다른 경로로 저장되므로 불변).
+2. `batch_replace({ doc_id, replacements: [ /* 14개 placeholder 전부 */ ] })`
+3. `save_document({ doc_id, output_path: "<$PATHS.downloads>/<자동파일명>.hwpx" })`  — 원본 템플릿이 아닌 Downloads 에 저장됨.
+4. `close_document({ doc_id })`
 
 Placeholder 이름·예시는 **`REFERENCE.md` 의 "Mode A placeholder" 섹션** 참조 필수.
 
@@ -88,13 +71,12 @@ Placeholder 이름·예시는 **`REFERENCE.md` 의 "Mode A placeholder" 섹션**
 
 ## Mode B — 스타일팔레트
 
-**흐름** (MCP 5~6회):
-1. Bash: `cp <TEMPLATE_DIR>공문서_프레임.hwpx <HOME>/Downloads/<자동파일명>.hwpx`
-2. `open_document({ file_path })` → `{ doc_id }`
-3. `batch_replace({ replacements: [ {{title}}, {{date}}, {{dept}}, {{summary}} ] })`
-4. `build_document({ doc_id, template_profile: "gongmun_v1", after_index: 6, elements: [ ... preset 지정 ... ] })`
-5. `save_document`
-6. `close_document`
+**흐름** (MCP 5회 — Bash 불필요):
+1. `open_document({ file_path: <templates[i].path> })` → `{ doc_id }`  — 템플릿 직접 열기.
+2. `batch_replace({ doc_id, replacements: [ {{title}}, {{date}}, {{dept}}, {{summary}} ] })`
+3. `build_document({ doc_id, template_profile: "gongmun_v1", after_index: 6, elements: [ ... preset 지정 ... ] })`
+4. `save_document({ doc_id, output_path: "<$PATHS.downloads>/<자동파일명>.hwpx" })`
+5. `close_document({ doc_id })`
 
 **본문 preset 이름** (단락): `heading`(□), `point`(ㅇ), `detail`(-), `subdetail`(ㆍ), `footnote`(*), `table_title`, `table_note` / **(표)** `table_header`, `table_body`.
 
@@ -113,7 +95,8 @@ Placeholder 이름·예시는 **`REFERENCE.md` 의 "Mode A placeholder" 섹션**
 1. `create_document({ title, creator })` → `{ doc_id }`
 2. (병렬 3회) `update_paragraph_text` + `set_paragraph_style` + `set_text_style` (제목)
 3. `build_document({ doc_id, after_index: 0, elements: [ ... inline 스타일 ... ] })`
-4. `save_document`
+4. `save_document({ doc_id, output_path: "<$PATHS.downloads>/<자동파일명>.hwpx" })`
+5. `close_document({ doc_id })`
 
 **inline 스타일 필드**, DGIST 계층 표준(폰트 크기·여백·줄간격), 표 폭 권장은 **`REFERENCE.md` 의 "Mode C 상세" 섹션** 참조.
 
@@ -128,8 +111,9 @@ Placeholder 이름·예시는 **`REFERENCE.md` 의 "Mode A placeholder" 섹션**
 ## 저장 경로·파일명 (3모드 공통)
 
 사용자 미지정 시:
-- 경로: `<HOME>/Downloads/` (Windows: `<USERPROFILE>\Downloads\`)
+- 경로: `$PATHS.downloads` (Step 0 의 `get_user_paths` 결과에서 이미 확보됨)
 - 파일명: 문서 제목 → 공백을 `_`로, 특수문자(`/ \ : * ? " < > |`) 제거, `.hwpx` 확장자
+- path.join 은 `$PATHS.os === "win32"` 면 `\`, 아니면 `/` 로 조합 — 실무적으론 `save_document({ output_path })` 가 양쪽 구분자 모두 받아주므로 `<downloads>/<파일명>.hwpx` 포맷 그대로 넘겨도 무방
 - 예: `정보전산팀_2026년_AI_교육_계획.hwpx`
 
 되묻지 말고 자동 결정 후 저장 메시지에 최종 경로 포함.
@@ -139,13 +123,15 @@ Placeholder 이름·예시는 **`REFERENCE.md` 의 "Mode A placeholder" 섹션**
 ## 도구 사용 핵심
 
 ### 필수
+- `get_user_paths` — **Step 0 1회**. 실제 사용자 HOME/Downloads/템플릿 경로 확보 (Bash 로 대체 금지)
 - `open_document` / `create_document` — 진입점
 - `batch_replace` — Mode A 필수, Mode B 권장 (제목·날짜·개요)
 - `build_document` — **본문 생성의 중심**. 모드 B 는 `template_profile` + `preset`, 모드 C 는 inline 스타일
-- `save_document` — 반드시 호출 (메모리만 바뀐 채 끝내지 말 것)
+- `save_document` — 반드시 `output_path` 와 함께 호출 (Downloads 로 저장, 원본 템플릿은 불변)
 - `close_document` — 세션 정리
 
 ### 금지
+- **Bash 로 경로·파일시스템 조작 금지** (`echo $HOME`, `cp`, `dir`, `ls`, `cmd /c` 등). Claude Desktop 샌드박스에서는 사용자 파일이 안 보이며, 경로 탐지는 무조건 `get_user_paths`, 파일 복제는 `save_document(output_path)` 로 대체.
 - `insert_paragraph` 반복 호출 금지 → 언제나 `build_document`
 - Mode B 에서 preset + inline 스타일 혼용 금지
 - Mode A 에서 `get_paragraphs` / `update_paragraph_text` 개별 호출 금지 (batch_replace 1회로 충분)
@@ -173,7 +159,8 @@ Placeholder 이름·예시는 **`REFERENCE.md` 의 "Mode A placeholder" 섹션**
 
 ## 참고
 
-- MCP 도구: 133+ (v0.5.0)
+- MCP 도구: 135 (v0.5.2 에서 `get_user_paths` 추가)
 - 템플릿 버전: 2026-04-24 기준
 - 프로필 등록: `mcp-server/src/TemplateProfiles.ts`
+- 경로 헬퍼: `mcp-server/src/UserPaths.ts`
 - GitHub: https://github.com/flamingo8006/hwpx-mcp
