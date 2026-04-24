@@ -6210,6 +6210,13 @@ export class HwpxDocument {
    * wrapper counts as 1 in walker-space, and the nested tbl mem-entry counts
    * as 0. Additionally, pending inserts that haven't been applied yet don't
    * exist in the current XML — we skip them when translating.
+   *
+   * Nested-tbl detection: prefer the parser-emitted `HwpxTable.isNestedInWrapper`
+   * flag (set for every tbl physically inside a wrapsTable wrapper, including
+   * the case where one wrapper holds multiple nested tbls). Fall back to the
+   * legacy "previous mem entry is a wrapsTable paragraph" heuristic when the
+   * flag is absent (e.g. older in-memory tables constructed without parser
+   * involvement).
    */
   private computeWalkerTargetIndex(
     sectionIndex: number,
@@ -6229,9 +6236,13 @@ export class HwpxDocument {
 
       // Skip nested tables: parser promotes the tbl inside a wrapsTable
       // wrapper paragraph to its own mem entry, but the walker swallows it
-      // via the wrapper's <hp:p> closing tag. Recognise it by looking at the
-      // previous mem entry.
+      // via the wrapper's <hp:p> closing tag.
       if (el.type === 'table') {
+        const tbl = el.data as HwpxTable;
+        if (tbl.isNestedInWrapper) {
+          continue;
+        }
+        // Fallback heuristic for tables without the flag set.
         const prev = i > 0 ? section.elements[i - 1] : null;
         if (prev?.type === 'paragraph' && (prev.data as HwpxParagraph).wrapsTable) {
           continue;

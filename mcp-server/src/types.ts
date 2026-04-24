@@ -924,6 +924,18 @@ export interface HwpxTable {
   outMargin?: ObjectMargin;
   lock?: boolean;
   linesegs?: LineSeg[];
+  /**
+   * Set by the parser when this table was physically nested inside an
+   * `<hp:p>` wrapper that also contained `<hp:t>` text runs (e.g. DGIST
+   * 공문서 frame title/summary boxes). The XML walker in HwpxDocument absorbs
+   * the nested `<hp:tbl>` into the wrapper's `<hp:p>...</hp:p>` span, so
+   * save-time mem→walker index translation must skip this entry. See
+   * `computeWalkerTargetIndex` in HwpxDocument.ts.
+   *
+   * Paired with `HwpxParagraph.wrapsTable` on the wrapper paragraph. Multiple
+   * nested tables inside a single wrapper each carry this flag.
+   */
+  isNestedInWrapper?: boolean;
 }
 
 // ============================================================
