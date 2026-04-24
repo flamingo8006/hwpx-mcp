@@ -1,7 +1,7 @@
 {
   "name": "hwpx-mcp-server",
-  "version": "0.5.1",
-  "description": "MCP Server for HWPX (Korean Hangul) document editing - 133 tools (form-fill / style-palette / free-form modes) for AI-powered document automation",
+  "version": "0.5.2",
+  "description": "MCP Server for HWPX (Korean Hangul) document editing - 135 tools (form-fill / style-palette / free-form modes + get_user_paths for Claude Desktop sandbox compatibility) for AI-powered document automation",
   "main": "dist/index.js",
   "bin": {
     "hwpx-mcp-server": "./dist/index.js"
