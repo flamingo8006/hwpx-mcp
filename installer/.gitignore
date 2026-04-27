@@ -1,0 +1,4 @@
+# payload/ is populated by scripts/build-installer.sh at release time from
+# dist-skill/. The source of truth for the payload files lives in dist-skill/
+# (itself gitignored), so we don't check them in here.
+payload/
