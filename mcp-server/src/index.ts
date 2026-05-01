@@ -111,7 +111,11 @@ function countDocsForOwner(ownerKey: string): number {
 /** Returns an error message if either the global or the per-owner cap is
  *  reached, otherwise null. Caller should `return error(msg)` if non-null.
  *  The global cap protects the host's memory; the per-owner cap stops one
- *  authenticated tenant from DoSing the others. */
+ *  authenticated tenant from DoSing the others.
+ *
+ *  WARNING: must be called inside withCreationLock() — otherwise two
+ *  concurrent creation requests can both pass the check before either
+ *  inserts, blowing past the cap. */
 function checkOpenDocCaps(ownerKey: string): string | null {
   const globalCap = maxOpenDocuments();
   if (openDocuments.size >= globalCap) {
@@ -122,6 +126,19 @@ function checkOpenDocCaps(ownerKey: string): string | null {
     return `you have reached your per-tenant max open documents (${perOwnerCap}); close some first`;
   }
   return null;
+}
+
+// Synthetic lock key serializing all creation-path requests against the
+// shared openDocuments / docOwners Maps. Without it the cap check and the
+// subsequent .set() call form a TOCTOU window — two concurrent creates
+// from the same owner can both pass the check before either records a
+// document, blowing past the cap. We pay a small cost (creates run
+// sequentially) to make the cap accurate. Reads/writes against existing
+// docs are unaffected; they go through withDocumentLock(doc_id) which
+// runs in parallel for distinct doc_ids.
+const CREATION_LOCK_KEY = '__creation__';
+function withCreationLock<T>(operation: () => Promise<T>): Promise<T> {
+  return withDocumentLock(CREATION_LOCK_KEY, operation);
 }
 
 // Document-level locks to prevent race conditions during parallel updates
@@ -2796,23 +2813,25 @@ Call get_tool_guide with: template, table, image, search, read, create`
         const filePath = expandPath(args?.file_path as string);
         if (!filePath) return error('file_path is required');
 
-        const capErr = checkOpenDocCaps(ownerKey);
-        if (capErr) return error(capErr);
-
         const absolutePath = path.resolve(filePath);
         const data = fs.readFileSync(absolutePath);
-        const docId = generateId();
 
-        const doc = await HwpxDocument.createFromBuffer(docId, absolutePath, data);
-        openDocuments.set(docId, doc);
-        docOwners.set(docId, ownerKey);
+        return withCreationLock(async () => {
+          const capErr = checkOpenDocCaps(ownerKey);
+          if (capErr) return error(capErr);
 
-        return success({
-          doc_id: docId,
-          format: doc.format,
-          path: absolutePath,
-          structure: doc.getStructure(),
-          metadata: doc.getMetadata(),
+          const docId = generateId();
+          const doc = await HwpxDocument.createFromBuffer(docId, absolutePath, data);
+          openDocuments.set(docId, doc);
+          docOwners.set(docId, ownerKey);
+
+          return success({
+            doc_id: docId,
+            format: doc.format,
+            path: absolutePath,
+            structure: doc.getStructure(),
+            metadata: doc.getMetadata(),
+          });
         });
       }
 
@@ -2833,9 +2852,6 @@ Call get_tool_guide with: template, table, image, search, read, create`
         if (!filename) return error('filename is required');
         if (!dataB64) return error('data_base64 is required');
 
-        const capErr = checkOpenDocCaps(ownerKey);
-        if (capErr) return error(capErr);
-
         let buffer: Buffer;
         try {
           buffer = Buffer.from(dataB64, 'base64');
@@ -2844,18 +2860,23 @@ Call get_tool_guide with: template, table, image, search, read, create`
         }
         if (buffer.length === 0) return error('decoded payload is empty');
 
-        const docId = generateId();
-        const doc = await HwpxDocument.createFromBuffer(docId, filename, buffer);
-        openDocuments.set(docId, doc);
-        docOwners.set(docId, ownerKey);
+        return withCreationLock(async () => {
+          const capErr = checkOpenDocCaps(ownerKey);
+          if (capErr) return error(capErr);
 
-        return success({
-          doc_id: docId,
-          format: doc.format,
-          filename,
-          size_bytes: buffer.length,
-          structure: doc.getStructure(),
-          metadata: doc.getMetadata(),
+          const docId = generateId();
+          const doc = await HwpxDocument.createFromBuffer(docId, filename, buffer);
+          openDocuments.set(docId, doc);
+          docOwners.set(docId, ownerKey);
+
+          return success({
+            doc_id: docId,
+            format: doc.format,
+            filename,
+            size_bytes: buffer.length,
+            structure: doc.getStructure(),
+            metadata: doc.getMetadata(),
+          });
         });
       }
 
@@ -5009,16 +5030,18 @@ Call get_tool_guide with: template, table, image, search, read, create`
 
       // === Create New Document ===
       case 'create_document': {
-        const capErr = checkOpenDocCaps(ownerKey);
-        if (capErr) return error(capErr);
-        const docId = generateId();
-        const doc = HwpxDocument.createNew(docId, args?.title as string, args?.creator as string);
-        openDocuments.set(docId, doc);
-        docOwners.set(docId, ownerKey);
-        return success({
-          doc_id: docId,
-          format: 'hwpx',
-          message: 'New document created',
+        return withCreationLock(async () => {
+          const capErr = checkOpenDocCaps(ownerKey);
+          if (capErr) return error(capErr);
+          const docId = generateId();
+          const doc = HwpxDocument.createNew(docId, args?.title as string, args?.creator as string);
+          openDocuments.set(docId, doc);
+          docOwners.set(docId, ownerKey);
+          return success({
+            doc_id: docId,
+            format: 'hwpx',
+            message: 'New document created',
+          });
         });
       }
 

@@ -302,4 +302,23 @@ describe('HTTP transport — per-owner document cap', () => {
     // Now A can create again
     expect((await call(TOKEN_A, 'create_document', { title: 'a4' }, 324)).doc_id).toBeDefined();
   });
+
+  it('cap is enforced atomically under concurrent creation requests', async () => {
+    // Without the creation lock, two concurrent create_document calls could
+    // both pass the cap check before either inserts into openDocuments,
+    // letting the per-owner cap be exceeded. With the lock in place,
+    // exactly `cap` requests succeed and the rest are rejected.
+    process.env.MCP_MAX_OPEN_DOCS_PER_OWNER = '3';
+
+    const requests = Array.from({ length: 8 }, (_, i) =>
+      call(TOKEN_A, 'create_document', { title: `concurrent-${i}` }, 400 + i)
+    );
+    const results = await Promise.all(requests);
+
+    const succeeded = results.filter((r) => r.doc_id).length;
+    const rejected = results.filter((r) => /per-tenant/i.test(String(r.error ?? ''))).length;
+
+    expect(succeeded).toBe(3);  // exactly the cap, never more
+    expect(rejected).toBe(5);
+  });
 });
