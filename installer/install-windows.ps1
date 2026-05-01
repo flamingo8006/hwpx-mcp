@@ -12,8 +12,10 @@
     * Backs up replaced items to <target>.bak-<timestamp> and prunes older
       backups so at most 2 remain per target.
     * Only touches its own keys:
-        - mcpServers.hwpx inside claude_desktop_config.json  (other MCPs are
-          preserved byte-for-byte)
+        - mcpServers.hwpx inside claude_desktop_config.json (other MCP
+          entries' VALUES are preserved -- file is reserialized via
+          ConvertTo-Json so indentation / whitespace / key order / line
+          endings may shift; original is saved to .bak-<timestamp>)
         - ~\.claude\skills\hwpx-document-writer            (other skills
           under ~\.claude\skills are not touched)
         - ~\Documents\skills\templates\<template>.hwpx     (other templates
@@ -202,6 +204,60 @@ Write-Host '========================================' -ForegroundColor White
 Write-Host ''
 
 # ---------------------------------------------------------------------------
+# 0. Claude Desktop running-process guard
+# ---------------------------------------------------------------------------
+# If Claude Desktop is running, it holds the old config in memory and will
+# not pick up our changes until fully quit + relaunched. The first DGIST
+# tester deployment hit this and saw "hwpx-mcp 도구가 연결되어 있지 않습
+# 니다" even though the config file on disk was correct. Detect early and
+# let the user decide whether to abort or proceed.
+Write-Step 'Checking Claude Desktop process'
+# Get-Process matches by name only. We follow up with a $_.Path filter to
+# avoid false positives from unrelated binaries also named Claude.exe.
+#
+# Caveats handled below:
+#  * MSIX / Microsoft Store builds run under a sandbox where $_.Path is
+#    often $null for a standard user (no perms to read the Process Path
+#    property). To avoid missing a Store install entirely, treat null Path
+#    as "trust the name" -- it's better to over-warn than to silently skip
+#    the guard for Store users.
+#  * Real Store install path is C:\Program Files\WindowsApps\<package>\Claude.exe
+#    (the *\Packages\Claude_*\... tree is the per-user config sandbox, NOT
+#    the executable location).
+$claudeProcs = @(Get-Process -Name 'Claude' -ErrorAction SilentlyContinue | Where-Object {
+    if (-not $_.Path) {
+        # Path unavailable (MSIX sandbox / permission denied) -> fall back
+        # to name match. Most likely this IS Claude Desktop.
+        return $true
+    }
+    $_.Path -like '*\Claude\Claude.exe' -or
+    $_.Path -like '*\WindowsApps\*Claude*\Claude.exe' -or
+    $_.Path -like '*\AnthropicClaude\*\Claude.exe'
+})
+if ($claudeProcs.Count -gt 0) {
+    $pidList = ($claudeProcs | ForEach-Object { $_.Id }) -join ', '
+    Write-Warn2 "Claude Desktop is currently running (PID: $pidList)."
+    Write-Info 'It holds the old config in memory; changes will not take effect until you'
+    Write-Info 'fully quit it (system tray icon -> Quit) and reopen.'
+
+    # PowerShell's $Host.UI.RawUI.KeyAvailable is unreliable; use Read-Host
+    # but only when stdin is interactive (Read-Host throws under -NonInteractive).
+    $isInteractive = -not ([Console]::IsInputRedirected)
+    if ($isInteractive) {
+        $ans = Read-Host 'Continue anyway? [y/N]'
+        if ($ans -notmatch '^(y|Y|yes|YES)$') {
+            Write-Fail 'Aborted by user. Quit Claude Desktop, then rerun this installer.'
+            exit 7
+        }
+        Write-Info 'Proceeding. Remember to fully quit and reopen Claude Desktop afterwards.'
+    } else {
+        Write-Info '(non-interactive shell -- proceeding without prompt; do quit + reopen Claude Desktop after install)'
+    }
+} else {
+    Write-Ok 'Claude Desktop is not running.'
+}
+
+# ---------------------------------------------------------------------------
 # 1. Payload sanity
 # ---------------------------------------------------------------------------
 Write-Step 'Checking payload files'
@@ -364,13 +420,16 @@ if (Test-Path -LiteralPath $SkillTarget) {
     Move-AsideWithBackup -Path $SkillTarget | Out-Null
 }
 
-# Clean up stray files left at the $SkillsRoot root by a prior buggy
-# install (v0.5.2 installer extracted the flat zip here directly, leaving
-# loose SKILL.md / REFERENCE.md siblings of the skill folders). Skills live
-# in subdirectories, so top-level files under $SkillsRoot are never valid.
+# Warn -- but never touch -- loose SKILL.md / REFERENCE.md siblings at the
+# skills root. The buggy v0.5.2 installer dropped these here; clean them
+# up manually if you see this warning. We intentionally do NOT delete files
+# outside our declared ownership scope (hwpx-document-writer\ subfolder only).
 Get-ChildItem -LiteralPath $SkillsRoot -File -Force -ErrorAction SilentlyContinue |
     Where-Object { $_.Name -in @('SKILL.md', 'REFERENCE.md') } |
-    Remove-Item -Force -ErrorAction SilentlyContinue
+    ForEach-Object {
+        Write-Warn2 "Loose $($_.Name) detected at $SkillsRoot\ -- not ours; left in place"
+        Write-Info  "If left over from a v0.5.2 install, remove manually: Remove-Item -LiteralPath '$($_.FullName)'"
+    }
 
 # Extract to a throwaway staging dir so we can cope with both flat zips
 # (SKILL.md at root) and nested zips (<folder>/SKILL.md) without leaving
