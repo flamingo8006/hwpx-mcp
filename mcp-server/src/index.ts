@@ -77,13 +77,52 @@ const openDocuments = new Map<string, HwpxDocument>();
 // other user's uploaded document if they learned its doc_id.
 const docOwners = new Map<string, string>();
 
-// Soft cap on total open documents to limit memory growth in HTTP mode
-// (no per-doc TTL implemented — operators are advised to restart the
-// container daily; see docs/deploy-dgist.md). Set high enough that a
-// reasonable session won't trip it. Unset = unlimited.
-const MAX_OPEN_DOCUMENTS = parseInt(process.env.MCP_MAX_OPEN_DOCS || '200', 10);
-
+// Soft caps to limit memory growth in HTTP mode (no per-doc TTL — operators
+// restart the container daily; see docs/deploy-dgist.md). Read each call so
+// tests can flip the env knobs without a module refactor.
 const STDIO_OWNER = 'local-stdio';
+
+function maxOpenDocuments(): number {
+  return parseInt(process.env.MCP_MAX_OPEN_DOCS || '200', 10);
+}
+function maxOpenDocumentsPerOwner(): number {
+  return parseInt(process.env.MCP_MAX_OPEN_DOCS_PER_OWNER || '50', 10);
+}
+
+/** Test-only: drop all open documents and lock state. Not used in
+ *  production — exported so the vitest suite can keep the module-scope
+ *  Maps from leaking between test cases. Calling this in production code
+ *  would break any in-flight session. */
+export function __resetDocStoreForTests(): void {
+  openDocuments.clear();
+  docOwners.clear();
+  documentLocks.clear();
+}
+
+/** Count how many open documents belong to a given ownerKey. */
+function countDocsForOwner(ownerKey: string): number {
+  let n = 0;
+  for (const owner of docOwners.values()) {
+    if (owner === ownerKey) n++;
+  }
+  return n;
+}
+
+/** Returns an error message if either the global or the per-owner cap is
+ *  reached, otherwise null. Caller should `return error(msg)` if non-null.
+ *  The global cap protects the host's memory; the per-owner cap stops one
+ *  authenticated tenant from DoSing the others. */
+function checkOpenDocCaps(ownerKey: string): string | null {
+  const globalCap = maxOpenDocuments();
+  if (openDocuments.size >= globalCap) {
+    return `server has reached max open documents (${globalCap}); close some first`;
+  }
+  const perOwnerCap = maxOpenDocumentsPerOwner();
+  if (countDocsForOwner(ownerKey) >= perOwnerCap) {
+    return `you have reached your per-tenant max open documents (${perOwnerCap}); close some first`;
+  }
+  return null;
+}
 
 // Document-level locks to prevent race conditions during parallel updates
 // Each document has a promise chain that serializes operations
@@ -2757,9 +2796,8 @@ Call get_tool_guide with: template, table, image, search, read, create`
         const filePath = expandPath(args?.file_path as string);
         if (!filePath) return error('file_path is required');
 
-        if (openDocuments.size >= MAX_OPEN_DOCUMENTS) {
-          return error(`server has reached max open documents (${MAX_OPEN_DOCUMENTS}); close some first`);
-        }
+        const capErr = checkOpenDocCaps(ownerKey);
+        if (capErr) return error(capErr);
 
         const absolutePath = path.resolve(filePath);
         const data = fs.readFileSync(absolutePath);
@@ -2795,9 +2833,8 @@ Call get_tool_guide with: template, table, image, search, read, create`
         if (!filename) return error('filename is required');
         if (!dataB64) return error('data_base64 is required');
 
-        if (openDocuments.size >= MAX_OPEN_DOCUMENTS) {
-          return error(`server has reached max open documents (${MAX_OPEN_DOCUMENTS}); close some first`);
-        }
+        const capErr = checkOpenDocCaps(ownerKey);
+        if (capErr) return error(capErr);
 
         let buffer: Buffer;
         try {
@@ -4972,9 +5009,8 @@ Call get_tool_guide with: template, table, image, search, read, create`
 
       // === Create New Document ===
       case 'create_document': {
-        if (openDocuments.size >= MAX_OPEN_DOCUMENTS) {
-          return error(`server has reached max open documents (${MAX_OPEN_DOCUMENTS}); close some first`);
-        }
+        const capErr = checkOpenDocCaps(ownerKey);
+        if (capErr) return error(capErr);
         const docId = generateId();
         const doc = HwpxDocument.createNew(docId, args?.title as string, args?.creator as string);
         openDocuments.set(docId, doc);

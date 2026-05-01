@@ -8,7 +8,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { AddressInfo } from 'net';
 import express from 'express';
 import { startHttpServer, parseTokens, parseAllowedOrigins, type HttpServerHandle } from './http';
-import { createServer as createMcpServer } from '../index';
+import { createServer as createMcpServer, __resetDocStoreForTests } from '../index';
 
 // Random port helper — let the OS pick.
 async function findFreePort(): Promise<number> {
@@ -28,6 +28,10 @@ let port: number;
 let handle: HttpServerHandle | null = null;
 
 beforeEach(async () => {
+  // Drop any state leaked from earlier test cases (openDocuments / docOwners
+  // are module-scope Maps that survive between vitest cases unless cleared).
+  __resetDocStoreForTests();
+
   port = await findFreePort();
   process.env.MCP_MODE = 'http';
   // Two tokens for multi-tenancy isolation tests
@@ -239,5 +243,63 @@ describe('HTTP transport — multi-tenancy isolation', () => {
     const r2 = await rpc('tools/call', { name: 'close_document', arguments: { doc_id: docA } }, 106, TOKEN_A);
     const result2 = toolResultText(r2.text);
     expect(result2.message).toMatch(/closed/i);
+  });
+});
+
+describe('HTTP transport — per-owner document cap', () => {
+  function toolResultText(text: string): any {
+    const msg = parseSseJson(text);
+    const txt = msg?.result?.content?.[0]?.text ?? '';
+    try { return JSON.parse(txt); } catch { return { _raw: txt }; }
+  }
+
+  // The cap helpers in index.ts read process.env on every call, so flipping
+  // these envs takes effect immediately without a server restart.
+  beforeEach(() => {
+    process.env.MCP_MAX_OPEN_DOCS_PER_OWNER = '2';
+  });
+  afterEach(() => {
+    delete process.env.MCP_MAX_OPEN_DOCS_PER_OWNER;
+  });
+
+  async function call(token: string, name: string, args: any, id: number) {
+    const r = await rpc('tools/call', { name, arguments: args }, id, token);
+    return toolResultText(r.text);
+  }
+
+  it('per-owner cap blocks the offending tenant', async () => {
+    // A burns through its 2-doc quota
+    expect((await call(TOKEN_A, 'create_document', { title: 'a1' }, 300)).doc_id).toBeDefined();
+    expect((await call(TOKEN_A, 'create_document', { title: 'a2' }, 301)).doc_id).toBeDefined();
+
+    // 3rd doc by A is rejected with the per-tenant cap message
+    const r3 = await call(TOKEN_A, 'create_document', { title: 'a3' }, 302);
+    expect(r3.error).toMatch(/per-tenant max open documents/i);
+  });
+
+  it("one tenant's cap does not block other tenants", async () => {
+    // A fills its quota
+    await call(TOKEN_A, 'create_document', { title: 'a1' }, 310);
+    await call(TOKEN_A, 'create_document', { title: 'a2' }, 311);
+    expect((await call(TOKEN_A, 'create_document', { title: 'a3' }, 312)).error).toMatch(/per-tenant/i);
+
+    // B's quota is independent
+    expect((await call(TOKEN_B, 'create_document', { title: 'b1' }, 313)).doc_id).toBeDefined();
+    expect((await call(TOKEN_B, 'create_document', { title: 'b2' }, 314)).doc_id).toBeDefined();
+    expect((await call(TOKEN_B, 'create_document', { title: 'b3' }, 315)).error).toMatch(/per-tenant/i);
+  });
+
+  it('closing a doc frees the per-owner slot', async () => {
+    const a1 = (await call(TOKEN_A, 'create_document', { title: 'a1' }, 320)).doc_id;
+    await call(TOKEN_A, 'create_document', { title: 'a2' }, 321);
+
+    // Cap reached
+    expect((await call(TOKEN_A, 'create_document', { title: 'a3' }, 322)).error).toMatch(/per-tenant/i);
+
+    // Close a1, freeing a slot
+    expect((await call(TOKEN_A, 'close_document', { doc_id: a1 }, 323)).message).toMatch(/closed/i);
+
+    // Now A can create again
+    expect((await call(TOKEN_A, 'create_document', { title: 'a4' }, 324)).doc_id).toBeDefined();
   });
 });

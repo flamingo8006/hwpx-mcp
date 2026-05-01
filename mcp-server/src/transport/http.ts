@@ -127,7 +127,8 @@ export async function startHttpServer(opts: HttpServerOptions): Promise<HttpServ
       new Promise<void>((resolve, reject) => {
         // closeAllConnections drops any sockets that are merely keep-alive
         // idle; without it, server.close() can hang for the OS keep-alive
-        // timeout (default 5s on Node 20). Tests need close() to be quick.
+        // timeout (default 5s). Available since Node 18.2; we feature-
+        // detect so the file remains compatible with older runtimes.
         if (typeof (server as any).closeAllConnections === 'function') {
           (server as any).closeAllConnections();
         }
