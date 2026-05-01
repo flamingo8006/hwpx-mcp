@@ -1,0 +1,59 @@
+# HWPX MCP — HTTP mode
+# Deploy behind the existing ask.dgist.ac.kr nginx reverse proxy.
+# Reverse proxy forwards ask.dgist.ac.kr/mcp -> 127.0.0.1:13701
+#
+# Usage:
+#   cp .env.example .env   # then fill MCP_TOKEN
+#   docker compose up -d
+#
+# To inspect:
+#   docker compose logs -f hwpx-mcp
+#   curl http://127.0.0.1:13701/health
+
+services:
+  hwpx-mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: hwpx-mcp:latest
+    container_name: hwpx-mcp
+    restart: unless-stopped
+
+    # Bind only to loopback — the nginx reverse proxy is the only public
+    # entrypoint. Do NOT expose this port on 0.0.0.0.
+    ports:
+      - "127.0.0.1:13701:13701"
+
+    environment:
+      MCP_MODE: http
+      MCP_PORT: "13701"
+      MCP_PATH: /mcp
+      MCP_MAX_BODY_MB: "50"
+      # Primary auth secret (set in .env)
+      MCP_TOKEN: ${MCP_TOKEN:-}
+      # Alternative: comma-separated multiple tokens for per-member rotation
+      # MCP_TOKENS: ${MCP_TOKENS:-}
+      # CORS allowlist (default: Claude.ai + ChatGPT web)
+      MCP_ALLOWED_ORIGINS: ${MCP_ALLOWED_ORIGINS:-https://claude.ai,https://chatgpt.com}
+
+    # Defense in depth: the MCP server itself never writes to disk in HTTP mode,
+    # but we also forbid writes at the container FS level.
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+
+    # Security hardening
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+    # Resource caps (tune to host)
+    mem_limit: 512m
+    cpus: 1.0
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"

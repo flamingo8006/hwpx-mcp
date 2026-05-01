@@ -35,3 +35,4 @@ mcp-server/src/test-*.hwpx
 .env
 .env.local
 mcp-server/.env
+mcp-server/.env.local
