@@ -70,6 +70,21 @@ console.error(`[HWPX MCP] Server starting - ${MCP_VERSION} - ${new Date().toISOS
 // Document storage
 const openDocuments = new Map<string, HwpxDocument>();
 
+// Multi-tenancy ownership map (HTTP mode only). Maps doc_id → ownerKey
+// (a per-bearer-token short hash). In stdio mode there is a single owner
+// so the map is used uniformly with the sentinel 'local-stdio'. Without
+// this guard, anyone holding a valid bearer token could read/write any
+// other user's uploaded document if they learned its doc_id.
+const docOwners = new Map<string, string>();
+
+// Soft cap on total open documents to limit memory growth in HTTP mode
+// (no per-doc TTL implemented — operators are advised to restart the
+// container daily; see docs/deploy-dgist.md). Set high enough that a
+// reasonable session won't trip it. Unset = unlimited.
+const MAX_OPEN_DOCUMENTS = parseInt(process.env.MCP_MAX_OPEN_DOCS || '200', 10);
+
+const STDIO_OWNER = 'local-stdio';
+
 // Document-level locks to prevent race conditions during parallel updates
 // Each document has a promise chain that serializes operations
 const documentLocks = new Map<string, Promise<void>>();
@@ -2508,7 +2523,16 @@ const READ_ONLY_TOOLS = new Set([
   'get_numbering_defs', 'get_bullet_defs',
 ]);
 
-export function createServer(): Server {
+/** Options for createServer(). Pass an ownerKey to scope every doc_id
+ *  reference to that owner — the HTTP transport sets it to the bearer
+ *  token's short hash, and stdio mode uses the STDIO_OWNER sentinel. */
+export interface CreateServerOptions {
+  /** Caller identity. Falls back to STDIO_OWNER (single-tenant). */
+  ownerKey?: string;
+}
+
+export function createServer(opts: CreateServerOptions = {}): Server {
+  const ownerKey = opts.ownerKey || STDIO_OWNER;
   const server = new Server(
     {
       name: 'hwpx-mcp-server',
@@ -2522,7 +2546,10 @@ export function createServer(): Server {
   );
 
   // In HTTP mode, hide tools that touch the local filesystem from the
-  // listing so remote clients don't try to call them.
+  // listing so remote clients don't try to call them. Snapshot the mode
+  // ONCE at server-construction time and close over it in both handlers
+  // so tools/list and tools/call cannot disagree mid-run if process.env
+  // somehow flips.
   const mode = currentMcpMode();
   const visibleTools =
     mode === 'http' ? tools.filter((t) => !FILESYSTEM_TOOLS.has(t.name)) : tools;
@@ -2532,28 +2559,38 @@ export function createServer(): Server {
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args } = request.params;
 
-    if (currentMcpMode() === 'http' && FILESYSTEM_TOOLS.has(name)) {
+    if (mode === 'http' && FILESYSTEM_TOOLS.has(name)) {
       return error(
         `Tool '${name}' is disabled in HTTP mode. ` +
           `Use upload_document_base64 / download_document_base64 for file I/O.`
       );
     }
 
+    // Multi-tenancy guard: in HTTP mode, every doc_id reference must
+    // belong to this caller. We return the same "Document not found"
+    // error a missing doc_id would yield, to avoid leaking the existence
+    // of someone else's documents to a probing client.
+    const docIdArg = args?.doc_id as string | undefined;
+    if (mode === 'http' && docIdArg && docOwners.has(docIdArg)) {
+      if (docOwners.get(docIdArg) !== ownerKey) {
+        return error('Document not found');
+      }
+    }
+
     // Auto-lock: mutating tools acquire a per-document lock automatically
-    const docId = args?.doc_id as string | undefined;
-    if (docId && !READ_ONLY_TOOLS.has(name)) {
-      return withDocumentLock(docId, async () => {
-        return handleToolCall(name, args);
+    if (docIdArg && !READ_ONLY_TOOLS.has(name)) {
+      return withDocumentLock(docIdArg, async () => {
+        return handleToolCall(name, args, ownerKey);
       });
     }
 
-    return handleToolCall(name, args);
+    return handleToolCall(name, args, ownerKey);
   });
 
   return server;
 }
 
-async function handleToolCall(name: string, args: Record<string, unknown> | undefined) {
+async function handleToolCall(name: string, args: Record<string, unknown> | undefined, ownerKey: string = STDIO_OWNER) {
   try {
     switch (name) {
       // === 🎯 Tool Guide ===
@@ -2720,12 +2757,17 @@ Call get_tool_guide with: template, table, image, search, read, create`
         const filePath = expandPath(args?.file_path as string);
         if (!filePath) return error('file_path is required');
 
+        if (openDocuments.size >= MAX_OPEN_DOCUMENTS) {
+          return error(`server has reached max open documents (${MAX_OPEN_DOCUMENTS}); close some first`);
+        }
+
         const absolutePath = path.resolve(filePath);
         const data = fs.readFileSync(absolutePath);
         const docId = generateId();
 
         const doc = await HwpxDocument.createFromBuffer(docId, absolutePath, data);
         openDocuments.set(docId, doc);
+        docOwners.set(docId, ownerKey);
 
         return success({
           doc_id: docId,
@@ -2738,7 +2780,10 @@ Call get_tool_guide with: template, table, image, search, read, create`
 
       case 'close_document': {
         const docId = args?.doc_id as string;
+        // Multi-tenancy guard already filtered foreign docIds at the
+        // dispatcher; here we just need to drop both maps in lockstep.
         if (openDocuments.delete(docId)) {
+          docOwners.delete(docId);
           return success({ message: 'Document closed' });
         }
         return error('Document not found');
@@ -2749,6 +2794,10 @@ Call get_tool_guide with: template, table, image, search, read, create`
         const dataB64 = args?.data_base64 as string;
         if (!filename) return error('filename is required');
         if (!dataB64) return error('data_base64 is required');
+
+        if (openDocuments.size >= MAX_OPEN_DOCUMENTS) {
+          return error(`server has reached max open documents (${MAX_OPEN_DOCUMENTS}); close some first`);
+        }
 
         let buffer: Buffer;
         try {
@@ -2761,6 +2810,7 @@ Call get_tool_guide with: template, table, image, search, read, create`
         const docId = generateId();
         const doc = await HwpxDocument.createFromBuffer(docId, filename, buffer);
         openDocuments.set(docId, doc);
+        docOwners.set(docId, ownerKey);
 
         return success({
           doc_id: docId,
@@ -2900,12 +2950,17 @@ Call get_tool_guide with: template, table, image, search, read, create`
       }
 
       case 'list_open_documents': {
-        const docs = Array.from(openDocuments.values()).map(d => ({
-          id: d.id,
-          path: d.path,
-          format: d.format,
-          isDirty: d.isDirty,
-        }));
+        // Multi-tenancy: only show documents this caller owns. In stdio
+        // mode docOwners is populated with STDIO_OWNER, which matches the
+        // default ownerKey, so behavior is unchanged for local users.
+        const docs = Array.from(openDocuments.values())
+          .filter((d) => docOwners.get(d.id) === ownerKey)
+          .map((d) => ({
+            id: d.id,
+            path: d.path,
+            format: d.format,
+            isDirty: d.isDirty,
+          }));
         return success({ documents: docs });
       }
 
@@ -4917,9 +4972,13 @@ Call get_tool_guide with: template, table, image, search, read, create`
 
       // === Create New Document ===
       case 'create_document': {
+        if (openDocuments.size >= MAX_OPEN_DOCUMENTS) {
+          return error(`server has reached max open documents (${MAX_OPEN_DOCUMENTS}); close some first`);
+        }
         const docId = generateId();
         const doc = HwpxDocument.createNew(docId, args?.title as string, args?.creator as string);
         openDocuments.set(docId, doc);
+        docOwners.set(docId, ownerKey);
         return success({
           doc_id: docId,
           format: 'hwpx',

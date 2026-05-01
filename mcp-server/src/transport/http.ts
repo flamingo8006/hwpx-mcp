@@ -1,16 +1,31 @@
 import express, { type Request, type Response, type NextFunction, type RequestHandler } from 'express';
 import cors from 'cors';
 import { createHash } from 'crypto';
+import type { Server as HttpServer } from 'http';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import type { Server } from '@modelcontextprotocol/sdk/server/index.js';
 
 export interface HttpServerOptions {
-  createServer: () => Server;
+  /**
+   * Factory invoked once per request to mint a stateless MCP Server.
+   * The transport supplies the authenticated caller's ownerKey (a short
+   * sha256 prefix of their bearer token) so the server can scope doc_ids
+   * to that caller — see docOwners in index.ts.
+   */
+  createServer: (opts: { ownerKey: string }) => Server;
   port: number;
   path: string;
   tokens: string[];
   allowedOrigins: string[];
   maxBodyMb: number;
+}
+
+/** Handle returned by startHttpServer() so callers can shut the listener down cleanly. */
+export interface HttpServerHandle {
+  /** Underlying http.Server (already listening). */
+  server: HttpServer;
+  /** Stop accepting new connections and resolve once existing ones close. */
+  close(): Promise<void>;
 }
 
 function shortTokenHash(token: string): string {
@@ -36,7 +51,7 @@ function buildAuthMiddleware(tokens: string[]): RequestHandler {
   };
 }
 
-export async function startHttpServer(opts: HttpServerOptions): Promise<void> {
+export async function startHttpServer(opts: HttpServerOptions): Promise<HttpServerHandle> {
   if (opts.tokens.length === 0) {
     throw new Error('MCP_TOKEN (or MCP_TOKENS) must be set when MCP_MODE=http');
   }
@@ -62,10 +77,13 @@ export async function startHttpServer(opts: HttpServerOptions): Promise<void> {
   const authenticate = buildAuthMiddleware(opts.tokens);
 
   // Stateless MCP: one Server + one Transport per request.
-  // Shared state (openDocuments Map) lives in module scope in index.ts,
-  // so doc_id survives across HTTP requests without session tracking.
+  // Shared state (openDocuments + docOwners Maps) lives in module scope
+  // in index.ts, so doc_id survives across HTTP requests without session
+  // tracking. ownerKey scopes each doc_id to the bearer token that
+  // uploaded it — see docOwners in index.ts.
   const mcpHandler: RequestHandler = async (req, res) => {
-    const server = opts.createServer();
+    const ownerKey = (req as any).tokenHash ?? 'anon';
+    const server = opts.createServer({ ownerKey });
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: undefined, // stateless mode
     });
@@ -91,17 +109,31 @@ export async function startHttpServer(opts: HttpServerOptions): Promise<void> {
   app.get(opts.path, authenticate, mcpHandler);
   app.delete(opts.path, authenticate, mcpHandler);
 
-  await new Promise<void>((resolve) => {
-    app.listen(opts.port, () => {
+  const server = await new Promise<HttpServer>((resolve) => {
+    const s = app.listen(opts.port, () => {
       const originsStr = opts.allowedOrigins.length > 0 ? opts.allowedOrigins.join(',') : '(any)';
       const hashes = opts.tokens.map(shortTokenHash).join(',');
       console.error(
         `[HWPX MCP] HTTP transport listening on :${opts.port}${opts.path}` +
           ` | tokens=[${hashes}] | origins=${originsStr}`
       );
-      resolve();
+      resolve(s);
     });
   });
+
+  return {
+    server,
+    close: () =>
+      new Promise<void>((resolve, reject) => {
+        // closeAllConnections drops any sockets that are merely keep-alive
+        // idle; without it, server.close() can hang for the OS keep-alive
+        // timeout (default 5s on Node 20). Tests need close() to be quick.
+        if (typeof (server as any).closeAllConnections === 'function') {
+          (server as any).closeAllConnections();
+        }
+        server.close((err) => (err ? reject(err) : resolve()));
+      }),
+  };
 }
 
 export function parseTokens(): string[] {

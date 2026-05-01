@@ -36,8 +36,8 @@
 ## 3. 컨테이너 기동
 
 ```bash
-# 1) 소스 받아오기
-git clone -b claude/deploy-mcp-cloud-CMMZs https://github.com/flamingo8006/hwpx-mcp.git
+# 1) 소스 받아오기 (HTTP 모드는 worktree-deploy-cloud-rebase 브랜치 — 안정화 후 main 머지 예정)
+git clone -b worktree-deploy-cloud-rebase https://github.com/flamingo8006/hwpx-mcp.git
 cd hwpx-mcp/mcp-server
 
 # 2) 토큰 생성 + .env 작성
@@ -143,7 +143,7 @@ AI가 자동으로:
 사용자: (수정된 report.hwpx 다운로드)
 ```
 
-서버 재시작 또는 유휴 시 메모리 내 `doc_id`는 증발합니다. 장기 저장은 AI 웹 쪽에 맡깁니다.
+서버 재시작 시 메모리 내 `doc_id` 와 업로드된 문서 바이트는 모두 사라집니다 (의도된 stateless 설계 — 디스크에 영속되는 사용자 데이터 없음). 단, **유휴(idle) 자동 만료는 아직 구현되어 있지 않으므로** 컨테이너가 계속 살아있는 동안 누적된 `doc_id` 는 명시적 `close_document` 호출 또는 재시작이 있을 때까지 메모리에 남습니다 — 운영 시 주기적 재기동(예: 매일 03:00 cron) 또는 메모리 사용량 모니터링 권장. 장기 저장은 AI 웹 쪽에 맡깁니다.
 
 ## 7. 보안 방어선
 
@@ -152,7 +152,7 @@ AI가 자동으로:
 | nginx | `limit_req 30r/m` + 선택적 IP 화이트리스트 |
 | MCP 앱 | Bearer 토큰 (env var), 토큰 해시만 로그 |
 | 컨테이너 | `read_only`, `tmpfs:/tmp`, `cap_drop ALL`, `no-new-privileges` |
-| 코드 | HTTP 모드에선 `open_document` / `save_document` / `export_to_*` / `insert_image*` 등록 자체를 스킵 |
+| 코드 | HTTP 모드에선 7개 파일시스템 툴 (`open_document`, `save_document`, `export_to_text`, `export_to_html`, `insert_image`, `insert_image_in_cell`, `get_user_paths`) 의 `tools/list` 노출 + `tools/call` 모두 차단 |
 
 토큰 유출 시: `.env` 수정 후 `docker compose up -d` — 즉시 무효화.
 

@@ -7,7 +7,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { AddressInfo } from 'net';
 import express from 'express';
-import { startHttpServer, parseTokens, parseAllowedOrigins } from './http';
+import { startHttpServer, parseTokens, parseAllowedOrigins, type HttpServerHandle } from './http';
 import { createServer as createMcpServer } from '../index';
 
 // Random port helper — let the OS pick.
@@ -21,62 +21,37 @@ async function findFreePort(): Promise<number> {
   });
 }
 
-const TOKEN = 'test-token-' + Math.random().toString(36).slice(2, 10);
+const TOKEN_A = 'token-A-' + Math.random().toString(36).slice(2, 10);
+const TOKEN_B = 'token-B-' + Math.random().toString(36).slice(2, 10);
+const TOKEN = TOKEN_A; // back-compat alias for single-token tests
 let port: number;
-let serverShutdown: (() => Promise<void>) | null = null;
+let handle: HttpServerHandle | null = null;
 
 beforeEach(async () => {
   port = await findFreePort();
-  // We re-use startHttpServer but need a way to stop it after each test.
-  // The function returns once the server is listening; we capture the
-  // underlying http.Server by patching app.listen via env-thread workaround:
-  // instead, just call into the same internals by inlining a minimal
-  // bootstrap that mirrors index.ts's main() http branch.
   process.env.MCP_MODE = 'http';
-  process.env.MCP_TOKEN = TOKEN;
+  // Two tokens for multi-tenancy isolation tests
+  process.env.MCP_TOKENS = `${TOKEN_A},${TOKEN_B}`;
   process.env.MCP_ALLOWED_ORIGINS = '*';
 
-  // We can't reuse startHttpServer directly because it doesn't expose the
-  // http.Server handle. The cleanest path: spin up startHttpServer, then
-  // shutdown via the listening process — but tests need to be independent,
-  // so we replicate the boot here using the same exported helpers.
-  // Replicating startHttpServer minimally:
-  await new Promise<void>(async (resolve, reject) => {
-    try {
-      // Override env-driven port for this test invocation
-      const baseStart = Date.now();
-      // startHttpServer reads from opts not env, so just call it
-      await startHttpServer({
-        createServer: createMcpServer,
-        port,
-        path: '/mcp',
-        tokens: parseTokens(),
-        allowedOrigins: parseAllowedOrigins(),
-        maxBodyMb: 50,
-      });
-      // We don't have access to the server handle, but Node will keep
-      // listening sockets open. Track elapsed for sanity.
-      void baseStart;
-      resolve();
-    } catch (err) {
-      reject(err);
-    }
+  handle = await startHttpServer({
+    createServer: createMcpServer,
+    port,
+    path: '/mcp',
+    tokens: parseTokens(),
+    allowedOrigins: parseAllowedOrigins(),
+    maxBodyMb: 50,
   });
-
-  // We don't have a clean shutdown because startHttpServer does not expose
-  // the http.Server. Tests must therefore each use a unique port (above) and
-  // tolerate the listener leaking until the vitest worker exits. This is
-  // acceptable for a smoke suite — vitest runs each file in a child process.
-  serverShutdown = async () => {
-    /* listener leaks intentionally — see comment above */
-  };
 });
 
 afterEach(async () => {
-  if (serverShutdown) await serverShutdown();
-  serverShutdown = null;
+  if (handle) {
+    await handle.close();
+    handle = null;
+  }
   delete process.env.MCP_MODE;
   delete process.env.MCP_TOKEN;
+  delete process.env.MCP_TOKENS;
   delete process.env.MCP_ALLOWED_ORIGINS;
 });
 
@@ -178,5 +153,91 @@ describe('HTTP transport', () => {
     // that contains a JSON-encoded { error: "..." } payload.
     const txt = msg?.result?.content?.[0]?.text ?? '';
     expect(txt).toMatch(/disabled in HTTP mode/i);
+  });
+});
+
+describe('HTTP transport — multi-tenancy isolation', () => {
+  // Helper to extract the inner JSON from our error()/success() helpers.
+  function toolResultText(text: string): any {
+    const msg = parseSseJson(text);
+    const txt = msg?.result?.content?.[0]?.text ?? '';
+    try { return JSON.parse(txt); } catch { return { _raw: txt }; }
+  }
+
+  // Helper to upload a tiny "document" via base64 and return doc_id.
+  // We use create_document instead because base64 upload requires a real
+  // HWPX byte stream; create_document just generates a fresh in-memory doc.
+  async function createDoc(token: string): Promise<string> {
+    const r = await rpc('tools/call', { name: 'create_document', arguments: { title: 'test', creator: 'tester' } }, 100, token);
+    expect(r.status).toBe(200);
+    const result = toolResultText(r.text);
+    expect(result.doc_id).toBeDefined();
+    return result.doc_id as string;
+  }
+
+  it("token A's doc_id is invisible to token B", async () => {
+    const docA = await createDoc(TOKEN_A);
+
+    // B tries to read A's doc — should get "Document not found"
+    const r = await rpc('tools/call', { name: 'get_document_text', arguments: { doc_id: docA } }, 101, TOKEN_B);
+    expect(r.status).toBe(200);
+    const result = toolResultText(r.text);
+    expect(result.error).toMatch(/Document not found/i);
+  });
+
+  it("token A's doc_id cannot be modified by token B", async () => {
+    const docA = await createDoc(TOKEN_A);
+
+    // B tries to write to A's doc — must be rejected (mutating tool path)
+    const r = await rpc(
+      'tools/call',
+      {
+        name: 'update_paragraph_text',
+        arguments: { doc_id: docA, paragraph_index: 0, text: 'hijacked' },
+      },
+      102,
+      TOKEN_B,
+    );
+    expect(r.status).toBe(200);
+    const result = toolResultText(r.text);
+    expect(result.error).toMatch(/Document not found/i);
+  });
+
+  it("list_open_documents only shows the caller's own docs", async () => {
+    const docA = await createDoc(TOKEN_A);
+    const docB1 = await createDoc(TOKEN_B);
+    const docB2 = await createDoc(TOKEN_B);
+
+    const r = await rpc('tools/call', { name: 'list_open_documents', arguments: {} }, 103, TOKEN_B);
+    const result = toolResultText(r.text);
+    const ids: string[] = (result.documents ?? []).map((d: any) => d.id);
+
+    expect(ids).toContain(docB1);
+    expect(ids).toContain(docB2);
+    expect(ids).not.toContain(docA);
+  });
+
+  it('A can still operate on its own doc after B is denied', async () => {
+    const docA = await createDoc(TOKEN_A);
+
+    // B's denial above did not corrupt the lock map; A still owns its doc.
+    const r = await rpc('tools/call', { name: 'get_document_text', arguments: { doc_id: docA } }, 104, TOKEN_A);
+    const result = toolResultText(r.text);
+    // success path: text field present (may be empty string for fresh doc)
+    expect(result.error).toBeUndefined();
+    expect(result.text).toBeDefined();
+  });
+
+  it('close_document by foreign owner is rejected (returns Document not found)', async () => {
+    const docA = await createDoc(TOKEN_A);
+
+    const r = await rpc('tools/call', { name: 'close_document', arguments: { doc_id: docA } }, 105, TOKEN_B);
+    const result = toolResultText(r.text);
+    expect(result.error).toMatch(/Document not found/i);
+
+    // A can still close its own doc
+    const r2 = await rpc('tools/call', { name: 'close_document', arguments: { doc_id: docA } }, 106, TOKEN_A);
+    const result2 = toolResultText(r2.text);
+    expect(result2.message).toMatch(/closed/i);
   });
 });
