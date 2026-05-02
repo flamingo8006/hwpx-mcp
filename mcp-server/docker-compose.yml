@@ -1,13 +1,15 @@
 # HWPX MCP — HTTP mode
-# Deploy behind the existing ask.dgist.ac.kr nginx reverse proxy.
-# Reverse proxy forwards ask.dgist.ac.kr/mcp -> 127.0.0.1:13701
+# Deploy behind the DGIST mcp.dgist.ac.kr nginx reverse proxy.
+# Reverse proxy forwards mcp.dgist.ac.kr/hwpx/ -> 127.0.0.1:13701/
+# (location /hwpx/ inside /etc/nginx/sites-available/dgist-ai — see
+#  docs/deploy-mcp-platform.md §8 for the single-domain multi-MCP pattern.)
 #
 # Usage:
 #   cp .env.example .env   # then fill MCP_TOKEN
-#   docker compose up -d
+#   docker compose --env-file .env up -d
 #
 # To inspect:
-#   docker compose logs -f hwpx-mcp
+#   docker compose --env-file .env logs -f hwpx-mcp
 #   curl http://127.0.0.1:13701/health
 
 services:

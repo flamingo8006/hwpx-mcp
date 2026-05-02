@@ -58,24 +58,19 @@ Claude.ai / ChatGPT 웹 → `https://ask.dgist.ac.kr/mcp` → nginx → 사내 D
 
 ## 3. 남은 작업
 
-### 3-1. DGIST AskON 운영 배포 가이드 (볼트 노트 참조 필요)
+### 3-1. ~~AskON 운영 배포 가이드~~ → ✅ AI-HUB 표준 기반 [`docs/deploy-mcp-platform.md`](./deploy-mcp-platform.md) 로 대체 (2026-05-02)
 
-사용자님 Obsidian 볼트의 **"DGIST Agentic AI 플랫폼 - AskON 운영 배포 가이드"** 노트를 참조해서 작성해야 함.
+운영 시스템이 AskON 에서 **AI-HUB(`/app/<svc>` + `/data/<svc>` + `dgist-ai` 단일 nginx 파일)** 로 이전되어, 본 항목은 그 표준에 맞춰 다시 작성됨. 도메인도 `ask.dgist.ac.kr/mcp` → `mcp.dgist.ac.kr/hwpx` 로 정리. 향후 외부 공개 MCP 가 늘어도 같은 도메인 + path 분기 (`/<svc>`) 로 누적.
 
-현재 세션(원격 샌드박스)에서는 볼트 접근 불가. 새 세션(Obsidian 붙은 데스크탑 앱)에서 진행.
-
-**작성 위치 후보**: `docs/deploy-askon.md`
-
-**포함해야 할 것 (추정)**
-- AskON 플랫폼 기준의 표준 배포 절차 (볼트 노트의 섹션 구조에 맞춤)
-- MCP 커넥터를 AskON 에 등록하는 방식 (웹 UI 경로 / 설정 파일)
-- 변경관리·롤백·보안심사 등 운영팀 표준 섹션
-- 로그·모니터링 연동 (SIEM/Grafana 등)
-- `docs/install-server.md` 와 중복되는 기술 절차는 참조만 하고 운영적 관점에 집중
+내부 전용 MCP (`mcp-internal.dgist.ac.kr`) 는 별도 트랙으로 분리 — 본 가이드 §부록 B 와 향후 작성될 internal 가이드 참조.
 
 ### 3-2. ~~npm publish 가이드~~ — 무효 (2026-05-01)
 
 분기 시점(2026-04-18) 에는 npm 공개 버전이 없었지만, 그 사이 main 에서 `hwpx-mcp-server@0.5.0`/`0.5.1`/`0.5.2` 가 모두 publish 됨. 이 항목은 outdated. 다음 publish 는 HTTP 모드를 안정화한 뒤 `0.5.3` 또는 `0.6.0` 으로 진행.
+
+### 3-3. main 머지 (2026-05-02 신규)
+
+`worktree-deploy-cloud-rebase` 의 4 커밋(HTTP 모드 + 멀티 테넌시 + per-owner cap + TOCTOU fix) + 본 세션의 운영 가이드 정리를 main 에 머지하고 `0.5.3` 또는 `0.6.0` 으로 npm publish. stdio 사용자에게 영향 없음 (회귀 테스트 494/494 green, MCP_MODE 미설정 시 기본 stdio).
 
 ## 4. 새 세션에서 이어가는 방법
 
