@@ -42,8 +42,24 @@ echo "==> Building server (tsc)"
 # ---------------------------------------------------------------------------
 echo "==> Staging bundle"
 rm -rf "$STAGE"
-mkdir -p "$STAGE/server"
+mkdir -p "$STAGE/server" "$STAGE/assets"
 cp -R "$SERVER_DIR/dist/." "$STAGE/server/"
+
+# Bundle the .hwpx templates (top-level only) into assets/. The server
+# self-deploys these to ~/Documents/skills/templates on first run.
+shopt -s nullglob
+template_count=0
+for tpl in "$DIST_SKILL"/*.hwpx; do
+  cp "$tpl" "$STAGE/assets/"
+  template_count=$((template_count + 1))
+done
+shopt -u nullglob
+if [ "$template_count" -eq 0 ]; then
+  echo "ERROR: no .hwpx templates found in $DIST_SKILL" >&2
+  echo "       Set HWPX_DIST_SKILL to the folder holding the template files." >&2
+  exit 1
+fi
+echo "==> Bundled $template_count template(s)"
 
 # Production-only node_modules: install into the stage root so Node resolves
 # them by walking up from server/index.js. `npm ci` (not `install`) for a

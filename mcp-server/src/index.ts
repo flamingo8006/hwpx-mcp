@@ -29,6 +29,7 @@ function expandPath(p: string | undefined): string | undefined {
 }
 import { HangingIndentCalculator } from './HangingIndentCalculator';
 import { collectUserPaths } from './UserPaths';
+import { deployBundledTemplates } from './TemplateDeployer';
 import {
   getTemplateProfile,
   listTemplateProfiles,
@@ -5474,6 +5475,19 @@ function escapeHtml(text: string): string {
 // ============================================================
 
 async function main() {
+  // First-run: land bundled templates into the user's folder (.mcpb install
+  // has no separate installer step). Local/stdio mode only — never in HTTP
+  // remote mode, where the server must not write the operator's filesystem.
+  if (process.env.MCP_MODE !== 'http') {
+    try {
+      const r = deployBundledTemplates();
+      if (r.deployed.length) console.error(`[templates] deployed: ${r.deployed.join(', ')} → ${r.targetDir}`);
+      for (const e of r.errors) console.error(`[templates] ${e}`);
+    } catch (e) {
+      console.error(`[templates] deploy skipped: ${(e as Error).message}`);
+    }
+  }
+
   const transport = new StdioServerTransport();
   await server.connect(transport);
 }
