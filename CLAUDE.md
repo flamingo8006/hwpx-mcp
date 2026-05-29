@@ -221,3 +221,71 @@ if (runIndex === 0) {
 2. `unzip -p file.hwpx Contents/section0.xml`로 XML 추출
 3. `<hp:pic>` 요소의 부모 태그 확인 (`<hp:run>` 안에 있어야 함)
 4. `<hp:curSz>` 값 확인 (0, 0이어야 함)
+
+---
+
+## 하네스 정책 (DGIST AI Harness)
+
+> 글로벌 `~/.claude/CLAUDE.md` 룰북을 따르며, 이 프로젝트 한정으로 다음 항목을 명시한다.
+> 빠진 항목은 글로벌 default 그대로.
+
+### 목적·범위
+
+HWPX 한글 문서 편집 MCP 서버 (npm 패키지 `hwpx-mcp-server`) + Claude Desktop·VSCode 통합. DGIST 구성원 대상 배포, IT 비전문가도 쉬운 설치가 필수 요건. 향후 HTTP 원격 배포(`mcp.dgist.ac.kr`) 트랙 별도 진행.
+
+### 자율성 패턴
+
+**Curated Allow-List** — 로컬 테스트·파일 편집·빌드는 자율, 운영 영향은 Ask-First.
+
+### 데이터 등급
+
+- **저민감도만** 흐름 — 코드·테스트 fixture·HWPX 샘플 파일·공개 문서
+- HWPX 사용자 파일은 *런타임에 클라이언트(LLM)가* MCP 도구로 전달하는 데이터로, 이 코드 리포지토리에는 저장되지 않음
+- 개발 surface(외부 LLM이 보는 범위): 코드·README·테스트만 — PII 0건이므로 자유
+
+### 외부 LLM 호출
+
+**런타임 호출 없음 (NA)** — 이 MCP 서버 코드 안에서 Anthropic·OpenAI·Gemini API 직접 호출 0건. LLM은 *클라이언트* 측(Claude Desktop·Codex 등)에서 이 MCP 도구를 호출하는 단방향 구조.
+
+개발 시 외부 LLM (Anthropic Claude·OpenAI Codex via `codex:codex-rescue`)이 코드를 보지만 PII 없으므로 자유.
+
+### Playbook 레벨
+
+**(b) 보안 강화** — base 보안 룰 + 다음 강화.
+
+### Secret 관리
+
+**현재 0건 — NA**
+- 코드·테스트·CI 모두 secret 미사용 (분석 결과: `process.env.HOME`만, secret 아님)
+- npm publish는 로컬 `npm login` per-user keychain
+- `.env.example`은 향후 HTTP 배포 트랙(`mcp.dgist.ac.kr`) 대비 placeholder
+
+### Ask-First (base 기본 5 + 프로젝트 추가)
+
+base 기본 5 카테고리(데이터·사용자 노출·인프라·외부 호출·환경 변경) 그대로 적용. 다음은 본 프로젝트 컨텍스트에서 특히 중요:
+
+| 작업 | 사유 |
+|---|---|
+| `npm publish hwpx-mcp-server` | DGIST 구성원 대상 배포 — 항상 사용자 승인 |
+| `git push origin main` | 보호 브랜치 (pre-commit hook도 차단) |
+| HWPX 파일 포맷 호환성에 영향 주는 XML 구조 변경 | 한글 호환성 회귀 가능 — 사용자에게 plan 제시 후 진행 |
+| 의존성(`hwp.js`·`jszip`·`@modelcontextprotocol/sdk`) 메이저 업그레이드 | API 변경 가능성 |
+
+### 현재 보안 상태 (2026-05-21 시점, 검증된 사실만)
+
+- **MCP 입력 검증**: `index.ts:2465`에서 `Server.setRequestHandler(CallToolRequestSchema, ...)` 저수준 API 사용. SDK는 CallToolRequest *메시지 envelope*만 검증하고 각 tool의 `inputSchema`에 대한 **인자 자동 검증은 하지 않음**. 인자는 `Record<string, unknown> | undefined` 그대로 `handleToolCall` switch에 전달 → 각 case가 필요 시 직접 캐스팅/체크 (`McpServer.tool()` 고수준 API였다면 `validateToolInput`이 Ajv로 검증했을 것).
+- **XML 파싱**: `HwpxParser.ts`는 DOM/SAX 파서 미사용, regex 매칭(`xml.match(/<...>/i)`)으로 필드 추출. DOM 파서가 아니므로 외부 entity 확장 자체가 일어나지 않음 = XXE 미해당. 단 regex 기반 파싱의 자체 한계(중첩·escape·malformed XML)는 별개 리스크.
+- **ZIP 처리**: `JSZip ^3.10.1`로 HWPX 압축 해제 (`HwpxParser.ts:213`은 알려진 entry를 키로 `file.async('string')` 호출, `:1139`·`:4371`은 base64 추출 루프).
+
+### 미검토 항목 (TODO — 작업 진입 시 확인 후 업데이트)
+
+- 각 tool case의 인자 캐스팅·체크 일관성 — schema 자동 검증이 없으므로 case별 직접 점검 필요
+- ZIP entry name path traversal 방어 — `../` 포함된 entry 명에 대한 가드 코드 미확인. base64 추출·파일 쓰기 경로 점검 필요
+- regex XML 파싱의 입력 길이·중첩 한계 — DoS 가능성 미평가
+- HTTP 원격 배포 트랙(`worktree-deploy-cloud-rebase`) 보안 — 인증·rate limit·CORS·SSRF 별도 트랙
+
+### 보안 원칙 (base + 프로젝트)
+
+- 새 외부 입력 처리 코드 추가 시 `~/.claude/base/security-baseline.md §A.4` 체크리스트 적용
+- `/security-check` 슬래시로 변경 셀프 점검
+- HWPX는 *사용자 로컬* 파일로 받는 입력이라 PII가 들어올 수 있지만, 이 코드 리포지토리에는 저장되지 않음 (런타임 흐름만)
