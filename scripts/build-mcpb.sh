@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+# Builds the hwpx MCP Bundle (.mcpb) for one-click install in Claude Desktop.
+#
+# An .mcpb (formerly .dxt) is a zip archive bundling the compiled MCP server
+# (dist/) plus its production node_modules and a manifest.json. Users install
+# it by double-clicking — no Node.js, no JSON editing, no terminal, no MOTW
+# console-closing problem that the .bat/.ps1 installer hits on hardened PCs.
+#
+# Output:
+#   dist-skill/hwpx-mcp-server.mcpb
+#
+# Run from anywhere:
+#   bash scripts/build-mcpb.sh
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+SERVER_DIR="$REPO_ROOT/mcp-server"
+STAGE="$SERVER_DIR/.mcpb-stage"
+
+# dist-skill/ is gitignored and lives in the main worktree. From a side
+# worktree, point HWPX_DIST_SKILL at the main repo's dist-skill/ folder.
+DIST_SKILL="${HWPX_DIST_SKILL:-$REPO_ROOT/dist-skill}"
+OUT="$DIST_SKILL/hwpx-mcp-server.mcpb"
+
+# Pinned packer version for reproducible builds (npx downloads/executes it).
+MCPB_CLI_VERSION="2.1.2"
+
+# argv-based load so a repo path containing a quote can't break the expression.
+VERSION="$(node -p "require(process.argv[1]).version" "$SERVER_DIR/package.json")"
+
+echo "==> hwpx-mcp-server@$VERSION → .mcpb"
+
+# ---------------------------------------------------------------------------
+# 1. Compile the server
+# ---------------------------------------------------------------------------
+echo "==> Building server (tsc)"
+( cd "$SERVER_DIR" && npm run build >/dev/null )
+
+# ---------------------------------------------------------------------------
+# 2. Stage bundle layout:  manifest.json + server/ + node_modules/
+# ---------------------------------------------------------------------------
+echo "==> Staging bundle"
+rm -rf "$STAGE"
+mkdir -p "$STAGE/server"
+cp -R "$SERVER_DIR/dist/." "$STAGE/server/"
+
+# Production-only node_modules: install into the stage root so Node resolves
+# them by walking up from server/index.js. `npm ci` (not `install`) for a
+# strict, lockfile-pinned, reproducible tree.
+if [ ! -f "$SERVER_DIR/package-lock.json" ]; then
+  echo "ERROR: mcp-server/package-lock.json required for reproducible build" >&2
+  exit 1
+fi
+cp "$SERVER_DIR/package.json" "$STAGE/package.json"
+cp "$SERVER_DIR/package-lock.json" "$STAGE/package-lock.json"
+echo "==> Installing production dependencies"
+( cd "$STAGE" && npm ci --omit=dev --no-audit --no-fund --silent )
+
+# ---------------------------------------------------------------------------
+# 3. Generate manifest.json
+#    - name kept STABLE across releases so Desktop treats new files as an
+#      in-place update (only `version` is bumped).
+#    - no user_config: local mode needs zero input → truly zero-prompt install.
+# ---------------------------------------------------------------------------
+echo "==> Writing manifest.json"
+cat > "$STAGE/manifest.json" <<JSON
+{
+  "manifest_version": "0.3",
+  "name": "hwpx-mcp-server",
+  "display_name": "HWPX 한글 문서 편집",
+  "version": "$VERSION",
+  "description": "HWPX(한글) 문서를 AI로 편집하는 MCP 서버 — 135개 도구 (서식 채우기 / 스타일 팔레트 / 자유 작성)",
+  "author": {
+    "name": "flamingo99",
+    "url": "https://github.com/flamingo8006/hwpx-mcp"
+  },
+  "homepage": "https://github.com/flamingo8006/hwpx-mcp",
+  "server": {
+    "type": "node",
+    "entry_point": "server/index.js",
+    "mcp_config": {
+      "command": "node",
+      "args": ["\${__dirname}/server/index.js"]
+    }
+  },
+  "compatibility": {
+    "platforms": ["darwin", "win32"],
+    "runtimes": {
+      "node": ">=18"
+    }
+  }
+}
+JSON
+
+# ---------------------------------------------------------------------------
+# 4. Pack with the official mcpb CLI (via npx — no global install)
+# ---------------------------------------------------------------------------
+echo "==> Packing"
+mkdir -p "$DIST_SKILL"
+npx --yes "@anthropic-ai/mcpb@$MCPB_CLI_VERSION" pack "$STAGE" "$OUT"
+
+echo "==> Done: $OUT"
+ls -lh "$OUT"
