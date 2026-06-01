@@ -2414,7 +2414,10 @@ Call this after modifying the document to ensure fresh data on next read operati
 const server = new Server(
   {
     name: 'hwpx-mcp-server',
-    version: '0.3.0',
+    // package.json 의 version 과 동기화 유지 (릴리스 시 함께 올릴 것).
+    // JSON import 는 .mcpb 번들이 package.json 을 stage 루트에만 두고 dist/ 옆에는
+    // 두지 않아 dist 기준 상대경로가 깨져 채택 X.
+    version: '0.5.3',
   },
   {
     capabilities: {
@@ -5478,7 +5481,7 @@ async function main() {
   // First-run: land bundled templates into the user's folder (.mcpb install
   // has no separate installer step). Local/stdio mode only — never in HTTP
   // remote mode, where the server must not write the operator's filesystem.
-  if (process.env.MCP_MODE !== 'http') {
+  if (process.env.MCP_MODE?.toLowerCase() !== 'http') {
     try {
       const r = deployBundledTemplates();
       if (r.deployed.length) console.error(`[templates] deployed: ${r.deployed.join(', ')} → ${r.targetDir}`);
