@@ -22,15 +22,15 @@ afterEach(() => {
 describe('deployBundledTemplates', () => {
   it('copies templates that are missing in the target', () => {
     fs.writeFileSync(path.join(assetsDir, '공문서_프레임.hwpx'), 'A');
-    fs.writeFileSync(path.join(assetsDir, '업무추진비_집행내역서.hwpx'), 'B');
+    fs.writeFileSync(path.join(assetsDir, '업무추진비류_집행내역서_서식.hwpx'), 'B');
 
     const r = deployBundledTemplates({ assetsDir, targetDir });
 
-    expect(r.deployed.sort()).toEqual(['공문서_프레임.hwpx', '업무추진비_집행내역서.hwpx']);
+    expect(r.deployed.sort()).toEqual(['공문서_프레임.hwpx', '업무추진비류_집행내역서_서식.hwpx']);
     expect(r.skipped).toEqual([]);
     expect(r.errors).toEqual([]);
     expect(fs.readFileSync(path.join(targetDir, '공문서_프레임.hwpx'), 'utf8')).toBe('A');
-    expect(fs.readFileSync(path.join(targetDir, '업무추진비_집행내역서.hwpx'), 'utf8')).toBe('B');
+    expect(fs.readFileSync(path.join(targetDir, '업무추진비류_집행내역서_서식.hwpx'), 'utf8')).toBe('B');
   });
 
   it('never overwrites an existing template (copy-if-missing)', () => {
@@ -47,13 +47,13 @@ describe('deployBundledTemplates', () => {
 
   it('deploys only the missing one when some already exist', () => {
     fs.writeFileSync(path.join(assetsDir, '공문서_프레임.hwpx'), 'A');
-    fs.writeFileSync(path.join(assetsDir, '업무추진비_집행내역서.hwpx'), 'B');
+    fs.writeFileSync(path.join(assetsDir, '업무추진비류_집행내역서_서식.hwpx'), 'B');
     fs.mkdirSync(targetDir, { recursive: true });
     fs.writeFileSync(path.join(targetDir, '공문서_프레임.hwpx'), 'A');
 
     const r = deployBundledTemplates({ assetsDir, targetDir });
 
-    expect(r.deployed).toEqual(['업무추진비_집행내역서.hwpx']);
+    expect(r.deployed).toEqual(['업무추진비류_집행내역서_서식.hwpx']);
     expect(r.skipped).toEqual(['공문서_프레임.hwpx']);
   });
 

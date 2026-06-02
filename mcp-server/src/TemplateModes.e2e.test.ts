@@ -13,7 +13,7 @@ import {
 
 const TEMPLATES_DIR = path.join(os.homedir(), 'Documents', 'skills', 'templates');
 const GONGMUN = path.join(TEMPLATES_DIR, '공문서_프레임.hwpx');
-const EXPENSE = path.join(TEMPLATES_DIR, '업무추진비_집행내역서.hwpx');
+const EXPENSE = path.join(TEMPLATES_DIR, '업무추진비류_집행내역서_서식.hwpx');
 
 // Guard: skip if templates not staged on this machine (CI safety).
 const hasGongmun = fs.existsSync(GONGMUN);
@@ -104,7 +104,7 @@ describe('Template modes — E2E against real templates', () => {
   });
 
   const d2 = hasExpense ? describe : describe.skip;
-  d2('mode (A) form-fill — 업무추진비_집행내역서.hwpx placeholder replacement', () => {
+  d2('mode (A) form-fill — 업무추진비류_집행내역서_서식.hwpx placeholder replacement', () => {
     it('all documented placeholders exist in the template text', async () => {
       const buf = fs.readFileSync(EXPENSE);
       const zip = await JSZip.loadAsync(buf);
@@ -117,7 +117,7 @@ describe('Template modes — E2E against real templates', () => {
         '{{회의내용1}}', '{{회의내용2}}',
       ];
       const missing = expected.filter(p => !sectionXml.includes(p));
-      expect(missing, `Missing placeholders in 업무추진비_집행내역서.hwpx: ${missing.join(', ')}`).toEqual([]);
+      expect(missing, `Missing placeholders in 업무추진비류_집행내역서_서식.hwpx: ${missing.join(', ')}`).toEqual([]);
     });
 
     it('batch_replace-like flow replaces every placeholder and produces a valid zip', async () => {
