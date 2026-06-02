@@ -7,7 +7,7 @@
 # console-closing problem that the .bat/.ps1 installer hits on hardened PCs.
 #
 # Output:
-#   dist-skill/hwpx-mcp-server.mcpb
+#   dist-skill/installers/hwpx-mcp-server.mcpb
 #
 # Run from anywhere:
 #   bash scripts/build-mcpb.sh
@@ -21,7 +21,7 @@ STAGE="$SERVER_DIR/.mcpb-stage"
 # dist-skill/ is gitignored and lives in the main worktree. From a side
 # worktree, point HWPX_DIST_SKILL at the main repo's dist-skill/ folder.
 DIST_SKILL="${HWPX_DIST_SKILL:-$REPO_ROOT/dist-skill}"
-OUT="$DIST_SKILL/hwpx-mcp-server.mcpb"
+OUT="$DIST_SKILL/installers/hwpx-mcp-server.mcpb"
 
 # Pinned packer version for reproducible builds (npx downloads/executes it).
 MCPB_CLI_VERSION="2.1.2"
@@ -45,18 +45,18 @@ rm -rf "$STAGE"
 mkdir -p "$STAGE/server" "$STAGE/assets"
 cp -R "$SERVER_DIR/dist/." "$STAGE/server/"
 
-# Bundle the .hwpx templates (top-level only) into assets/. The server
-# self-deploys these to ~/Documents/skills/templates on first run.
+# Bundle the .hwpx templates from dist-skill/templates/ into assets/. The
+# server self-deploys these to ~/Documents/skills/templates on first run.
 shopt -s nullglob
 template_count=0
-for tpl in "$DIST_SKILL"/*.hwpx; do
+for tpl in "$DIST_SKILL"/templates/*.hwpx; do
   cp "$tpl" "$STAGE/assets/"
   template_count=$((template_count + 1))
 done
 shopt -u nullglob
 if [ "$template_count" -eq 0 ]; then
-  echo "ERROR: no .hwpx templates found in $DIST_SKILL" >&2
-  echo "       Set HWPX_DIST_SKILL to the folder holding the template files." >&2
+  echo "ERROR: no .hwpx templates found in $DIST_SKILL/templates" >&2
+  echo "       Set HWPX_DIST_SKILL to the folder whose templates/ holds the files." >&2
   exit 1
 fi
 echo "==> Bundled $template_count template(s)"
@@ -113,7 +113,7 @@ JSON
 # 4. Pack with the official mcpb CLI (via npx — no global install)
 # ---------------------------------------------------------------------------
 echo "==> Packing"
-mkdir -p "$DIST_SKILL"
+mkdir -p "$(dirname "$OUT")"
 npx --yes "@anthropic-ai/mcpb@$MCPB_CLI_VERSION" pack "$STAGE" "$OUT"
 
 echo "==> Done: $OUT"
