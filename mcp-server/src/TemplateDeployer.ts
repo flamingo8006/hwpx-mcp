@@ -42,6 +42,11 @@ export interface DeployBundledTemplatesOptions {
  *   files are left untouched (idempotent, no churn). These are read-only form
  *   templates (users fill them and save the result elsewhere), so refreshing
  *   the canonical copy is the intended behaviour, not data loss.
+ * - Scoped to the bundled filenames only. The loop iterates the *bundle's*
+ *   templates, never the target folder, so a file the user created under any
+ *   other name is never read, overwritten, or removed — only these managed
+ *   template(s) are refreshed. (An in-place edit to a managed template is
+ *   intentionally replaced; to customise, copy it to a new filename.)
  * - Never throws. A locked-down FS must not break server startup; problems are
  *   collected into `errors` and logged by the caller.
  * - Logs go to stderr only — stdout is the MCP stdio protocol channel.
