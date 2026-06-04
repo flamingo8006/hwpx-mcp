@@ -33,16 +33,30 @@ describe('deployBundledTemplates', () => {
     expect(fs.readFileSync(path.join(targetDir, '업무추진비류_집행내역서_서식.hwpx'), 'utf8')).toBe('B');
   });
 
-  it('never overwrites an existing template (copy-if-missing)', () => {
+  it('refreshes an existing template when the bundled content differs', () => {
+    // Simulates a template update shipped in a new .mcpb reaching an install
+    // that already has the old (same-named) file.
     fs.writeFileSync(path.join(assetsDir, '공문서_프레임.hwpx'), 'NEW');
     fs.mkdirSync(targetDir, { recursive: true });
-    fs.writeFileSync(path.join(targetDir, '공문서_프레임.hwpx'), 'USER-EDITED');
+    fs.writeFileSync(path.join(targetDir, '공문서_프레임.hwpx'), 'OLD');
+
+    const r = deployBundledTemplates({ assetsDir, targetDir });
+
+    expect(r.deployed).toEqual(['공문서_프레임.hwpx']);
+    expect(r.skipped).toEqual([]);
+    expect(fs.readFileSync(path.join(targetDir, '공문서_프레임.hwpx'), 'utf8')).toBe('NEW');
+  });
+
+  it('skips an existing template with identical content (idempotent)', () => {
+    fs.writeFileSync(path.join(assetsDir, '공문서_프레임.hwpx'), 'SAME');
+    fs.mkdirSync(targetDir, { recursive: true });
+    fs.writeFileSync(path.join(targetDir, '공문서_프레임.hwpx'), 'SAME');
 
     const r = deployBundledTemplates({ assetsDir, targetDir });
 
     expect(r.deployed).toEqual([]);
     expect(r.skipped).toEqual(['공문서_프레임.hwpx']);
-    expect(fs.readFileSync(path.join(targetDir, '공문서_프레임.hwpx'), 'utf8')).toBe('USER-EDITED');
+    expect(r.errors).toEqual([]);
   });
 
   it('deploys only the missing one when some already exist', () => {

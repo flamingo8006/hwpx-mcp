@@ -5,9 +5,10 @@ import { collectUserPaths } from './UserPaths';
 export interface TemplateDeployResult {
   /** Absolute target directory templates are deployed into. */
   targetDir: string;
-  /** Filenames newly copied (were missing). */
+  /** Filenames copied — newly created, or refreshed because the bundled
+   *  content differed from the existing file. */
   deployed: string[];
-  /** Filenames left untouched (already present — never overwritten). */
+  /** Filenames left untouched (already present with identical content). */
   skipped: string[];
   /** Non-fatal problems (e.g. permission denied). Deploy never throws. */
   errors: string[];
@@ -28,18 +29,33 @@ export interface DeployBundledTemplatesOptions {
 }
 
 /**
- * Copy templates bundled inside the `.mcpb` extension into the user's
- * templates folder on first run, so a one-click install also lands the
- * document templates the skill expects — without a separate installer step.
+ * Copy templates bundled inside the `.mcpb` extension into the user's templates
+ * folder, so a one-click install also lands the document templates the skill
+ * expects — without a separate installer step. Runs on every server start (see
+ * caller), which makes it the update channel too.
  *
  * Design:
- * - Copy-if-missing only. An existing file is never overwritten, so a user's
- *   customised template survives. (Trade-off: existing users won't pick up
- *   template content updates this way — bump filename or handle separately.)
+ * - Refresh-if-changed. A missing file is created; an existing file is
+ *   overwritten only when the bundled content differs (compared byte-for-byte),
+ *   so shipping a new `.mcpb` propagates template updates to installs that
+ *   already have the old (same-named) file on the next start, while identical
+ *   files are left untouched (idempotent, no churn). These are read-only form
+ *   templates (users fill them and save the result elsewhere), so refreshing
+ *   the canonical copy is the intended behaviour, not data loss.
  * - Never throws. A locked-down FS must not break server startup; problems are
  *   collected into `errors` and logged by the caller.
  * - Logs go to stderr only — stdout is the MCP stdio protocol channel.
  */
+/** True when both paths hold byte-identical content (cheap size check first). */
+function sameContent(a: string, b: string): boolean {
+  try {
+    if (fs.statSync(a).size !== fs.statSync(b).size) return false;
+    return fs.readFileSync(a).equals(fs.readFileSync(b));
+  } catch {
+    return false;
+  }
+}
+
 export function deployBundledTemplates(
   opts: DeployBundledTemplatesOptions = {},
 ): TemplateDeployResult {
@@ -73,18 +89,32 @@ export function deployBundledTemplates(
   }
 
   for (const name of entries) {
+    const src = path.join(assetsDir, name);
     const dest = path.join(targetDir, name);
     try {
-      // COPYFILE_EXCL makes "copy only if missing" atomic — no check-then-copy
-      // race that could clobber a file appearing between the two steps.
-      fs.copyFileSync(path.join(assetsDir, name), dest, fs.constants.COPYFILE_EXCL);
+      // Skip only when the existing file already matches the bundle; otherwise
+      // create it (missing) or refresh it (content changed), so a template
+      // update shipped in a new .mcpb reaches installs that still hold the old
+      // same-named file.
+      if (fs.existsSync(dest) && sameContent(src, dest)) {
+        result.skipped.push(name);
+        continue;
+      }
+      // Atomic refresh: copy to a temp file in the same dir, then rename over
+      // the destination. A same-dir rename is atomic, so a crash mid-copy can
+      // never leave a half-written template, and it replaces a symlink entry
+      // instead of writing through it. Clean the temp up if the rename fails.
+      const tmp = `${dest}.tmp-${process.pid}`;
+      fs.copyFileSync(src, tmp);
+      try {
+        fs.renameSync(tmp, dest);
+      } catch (err) {
+        try { fs.unlinkSync(tmp); } catch { /* best-effort cleanup */ }
+        throw err;
+      }
       result.deployed.push(name);
     } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === 'EEXIST') {
-        result.skipped.push(name);
-      } else {
-        result.errors.push(`copy ${name}: ${(err as Error).message}`);
-      }
+      result.errors.push(`copy ${name}: ${(err as Error).message}`);
     }
   }
 

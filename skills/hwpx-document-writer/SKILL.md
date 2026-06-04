@@ -49,7 +49,7 @@ allowed-tools:
 
 | 사용자 발화 | 모드 | 템플릿 | 핵심 흐름 |
 |---|---|---|---|
-| "업무추진비 집행내역서", "○○ 양식 그대로 채워줘" | **(A) 폼필** | `업무추진비류_집행내역서_서식.hwpx` | Step 0 → **Step A-0(필수정보 역질문)** → open → batch_replace → save |
+| "업무추진비 집행내역서", "○○ 양식 그대로 채워줘" | **(A) 폼필** | `업무추진비류_집행내역서_서식.hwpx` | Step 0 → **Step A-0(필수정보 역질문)** → open → batch_replace → update_table_cell(참석자) → save |
 | "공문서 서식으로 ○○ 보고", "DGIST 공문 양식으로" | **(B) 스타일팔레트** | `공문서_프레임.hwpx` | Step 0 → open → batch_replace(제목/날짜) + build_document(본문) → save |
 | 그 외 (보고서/회의록/안내문/계획서, 서식 언급 없음) | **(C) 자유** | — | create_document → build_document → save |
 
@@ -65,19 +65,20 @@ allowed-tools:
 ### Step A-0 — 필수 정보 점검 및 역질문 (open 전에 반드시 수행)
 
 1. 대화 맥락에서 **필수 입력값**(`부서`·`사용자`·`일자`·`장소`·`금액`·`참석자`)을 스캔한다.
-2. 빠진 항목이 있으면 **하나의 메시지로 묶어 역질문**한다 (14개를 개별로 묻지 말 것). 사용자가 영수증·메모를 붙여넣으면 거기서 추출한다.
+2. 빠진 항목이 있으면 **하나의 메시지로 묶어 역질문**한다 (누락된 **필수 입력값만** 묶어서 — 파생·보강 필드는 묻지 않는다). 사용자가 영수증·메모를 붙여넣으면 거기서 추출한다.
 3. **필수값이 모두 확보되기 전에는 open 으로 진행 금지.**
 4. `금액`·`일자`·`참석자`는 추측·임의 생성 **절대 금지**. `부서`도 기본값 없이 반드시 확인 (정보전산팀 자동 가정 금지).
 
 필드 3계층(필수 입력 / 자동 파생 / 보강 생성) 정의·계산 규칙·보강 경계는 **`REFERENCE.md` 의 "Mode A placeholder" 섹션** 참조 필수.
 
-**흐름** (MCP 4회 — Bash 불필요, Step A-0 통과 후):
+**흐름** (MCP 5회 — Bash 불필요, Step A-0 통과 후):
 1. `open_document({ file_path: <templates[i].path> })` → `{ doc_id }`  — 템플릿을 직접 연다 (원본은 save 시점에 다른 경로로 저장되므로 불변).
-2. `batch_replace({ doc_id, replacements: [ /* 14개 placeholder 전부 */ ] })`
-3. `save_document({ doc_id, output_path: "<$PATHS.downloads>/<자동파일명>.hwpx" })`  — 원본 템플릿이 아닌 Downloads 에 저장됨.
-4. `close_document({ doc_id })`
+2. `batch_replace({ doc_id, replacements: [ /* 참석자 제외 10개 placeholder */ ] })`  — 부서·사용자·일자·장소·목적·금액한글·금액·1인금액·회의내용1·2
+3. `update_table_cell({ doc_id, section_index: 0, table_index: 0, row: 4, col: 0, text: "<참석자 블록>", char_shape_id: 12, auto_hanging_indent: false })`  — 참석자 명단(인원·소속 가변 줄). 셀 전체를 다시 쓰므로 라벨("4. 참  석  자 :")까지 포함. **`char_shape_id: 12` 미지정 시 폰트가 함초롬바탕 10pt 로 깨짐.**
+4. `save_document({ doc_id, output_path: "<$PATHS.downloads>/<자동파일명>.hwpx" })`  — 원본 템플릿이 아닌 Downloads 에 저장됨.
+5. `close_document({ doc_id })`
 
-Placeholder 이름·예시는 **`REFERENCE.md` 의 "Mode A placeholder" 섹션** 참조 필수.
+placeholder 목록·**참석자 블록 작성법**·**금액 표기 규칙**은 **`REFERENCE.md` 의 "Mode A placeholder" 섹션** 참조 필수.
 
 ---
 
@@ -172,7 +173,7 @@ Placeholder 이름·예시는 **`REFERENCE.md` 의 "Mode A placeholder" 섹션**
 ## 참고
 
 - MCP 도구: 135 (v0.5.2 에서 `get_user_paths` 추가)
-- 템플릿 버전: 2026-04-24 기준
+- 템플릿 버전: 2026-06-04 기준 (집행내역서 1인금액 "원" 추가)
 - 프로필 등록: `mcp-server/src/TemplateProfiles.ts`
 - 경로 헬퍼: `mcp-server/src/UserPaths.ts`
 - GitHub: https://github.com/flamingo8006/hwpx-mcp
