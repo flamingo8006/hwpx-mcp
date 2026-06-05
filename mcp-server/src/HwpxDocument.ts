@@ -8850,238 +8850,43 @@ export class HwpxDocument {
    * If charShapeId is provided, overrides the charPrIDRef attribute.
    */
   private updateTextInCell(cellXml: string, newText: string, charShapeId?: number): string {
-    // Check if text contains newlines - if so, create multiple paragraphs
-    if (newText.includes('\n')) {
-      return this.updateTextInCellMultiline(cellXml, newText, charShapeId);
-    }
-
-    // For long text without newlines, use chunked processing to avoid XML issues
-    // This creates multiple <hp:run> elements within the same paragraph
-    if (newText.length > HwpxDocument.TEXT_CHUNK_SIZE) {
-      return this.updateTextInCellChunked(cellXml, newText, charShapeId);
-    }
-
-    const escapedText = this.escapeXml(newText);
-    let xml = cellXml;
-
-    // If charShapeId is provided, update charPrIDRef in the first run tag
-    if (charShapeId !== undefined) {
-      xml = xml.replace(
-        /(<(?:hp|hs|hc):run\s+)charPrIDRef="[^"]*"/,
-        `$1charPrIDRef="${charShapeId}"`
-      );
-    }
-
-    // Pattern 1: Cell has existing <hp:t> or <hs:t> or <hc:t> tags with content
-    const tTagPattern = /(<(?:hp|hs|hc):t[^>]*>)([^<]*)(<\/(?:hp|hs|hc):t>)/g;
-    let foundText = false;
-    let result = xml.replace(tTagPattern, (match, openTag, _oldText, closeTag, offset) => {
-      // Only replace the first text occurrence
-      if (!foundText) {
-        foundText = true;
-        return openTag + escapedText + closeTag;
-      }
-      return match;
-    });
-
-    if (foundText) return this.resetLinesegInXml(result);
-
-    // Pattern 2: Cell has empty <hp:t/> or <hp:t></hp:t> tags
-    const emptyTTagPattern = /<((?:hp|hs|hc):t)([^>]*)\s*\/>/;
-    const emptyTMatch = xml.match(emptyTTagPattern);
-    if (emptyTMatch) {
-      const updated = xml.replace(emptyTTagPattern, `<${emptyTMatch[1]}${emptyTMatch[2]}>${escapedText}</${emptyTMatch[1]}>`);
-      return this.resetLinesegInXml(updated);
-    }
-
-    // Pattern 3a: Self-closing <hp:run .../> - expand to full run with text
-    const selfClosingRunPattern = /<((?:hp|hs|hc):run)([^>]*)\s*\/>/;
-    const selfClosingRunMatch = xml.match(selfClosingRunPattern);
-    if (selfClosingRunMatch) {
-      const tagName = selfClosingRunMatch[1]; // e.g., "hp:run"
-      let attrs = selfClosingRunMatch[2];
-      // If charShapeId is provided, update or add charPrIDRef
-      if (charShapeId !== undefined) {
-        if (attrs.includes('charPrIDRef=')) {
-          attrs = attrs.replace(/charPrIDRef="[^"]*"/, `charPrIDRef="${charShapeId}"`);
-        } else {
-          attrs = ` charPrIDRef="${charShapeId}"` + attrs;
-        }
-      }
-      const prefix = tagName.split(':')[0]; // e.g., "hp"
-      const updated = xml.replace(selfClosingRunPattern, `<${tagName}${attrs}><${prefix}:t>${escapedText}</${prefix}:t></${tagName}>`);
-      return this.resetLinesegInXml(updated);
-    }
-
-    // Pattern 3b: Cell has <hp:run> but no <hp:t> - add text inside run
-    const runPattern = /(<(?:hp|hs|hc):run[^>]*>)([\s\S]*?)(<\/(?:hp|hs|hc):run>)/;
-    const runMatch = xml.match(runPattern);
-    if (runMatch) {
-      const prefix = runMatch[1].match(/<(hp|hs|hc):run/)?.[1] || 'hp';
-      const newRunContent = runMatch[2] + `<${prefix}:t>${escapedText}</${prefix}:t>`;
-      const updated = xml.replace(runPattern, runMatch[1] + newRunContent + runMatch[3]);
-      return this.resetLinesegInXml(updated);
-    }
-
-    // Pattern 4: Cell has <hp:subList><hp:p> structure - find the paragraph and add text
-    const subListPattern = /(<(?:hp|hs|hc):subList[^>]*>[\s\S]*?<(?:hp|hs|hc):p[^>]*>)([\s\S]*?)(<\/(?:hp|hs|hc):p>)/;
-    const subListMatch = xml.match(subListPattern);
-    if (subListMatch) {
-      const prefix = subListMatch[1].match(/<(hp|hs|hc):subList/)?.[1] || 'hp';
-      // Check if there's already a run
-      if (!subListMatch[2].includes(':run')) {
-        const charAttr = charShapeId !== undefined ? ` charPrIDRef="${charShapeId}"` : '';
-        const newContent = subListMatch[2] + `<${prefix}:run${charAttr}><${prefix}:t>${escapedText}</${prefix}:t></${prefix}:run>`;
-        const updated = xml.replace(subListPattern, subListMatch[1] + newContent + subListMatch[3]);
-        return this.resetLinesegInXml(updated);
-      }
-    }
-
-    // Pattern 5: Cell has only <hp:p> without subList
-    const pPattern = /(<(?:hp|hs|hc):p[^>]*>)([\s\S]*?)(<\/(?:hp|hs|hc):p>)/;
-    const pMatch = xml.match(pPattern);
-    if (pMatch) {
-      const prefix = pMatch[1].match(/<(hp|hs|hc):p/)?.[1] || 'hp';
-      if (!pMatch[2].includes(':run') && !pMatch[2].includes(':t>')) {
-        const charAttr = charShapeId !== undefined ? ` charPrIDRef="${charShapeId}"` : '';
-        const newContent = pMatch[2] + `<${prefix}:run${charAttr}><${prefix}:t>${escapedText}</${prefix}:t></${prefix}:run>`;
-        const updated = xml.replace(pPattern, pMatch[1] + newContent + pMatch[3]);
-        return this.resetLinesegInXml(updated);
-      }
-    }
-
-    // Fallback: return unchanged (shouldn't happen in well-formed HWPX)
-    return xml;
+    // Always rebuild the ENTIRE cell content via the multiline path. It splits
+    // on newlines (a single paragraph for single-line text), chunks long lines,
+    // and clears ALL existing runs/paragraphs.
+    //
+    // The previous single-line branch replaced only the first <hp:t>, leaving
+    // trailing styled runs and extra paragraphs (e.g. template placeholders
+    // `{{참석자2}}`/`{{참석자3}}`) behind — producing duplicated/leftover text
+    // for cells with multiple runs or paragraphs. See SingleLineCellReplace.bug.test.ts.
+    return this.updateTextInCellMultiline(cellXml, newText, charShapeId);
   }
 
   /**
-   * Update text content in a cell with chunked runs (for long text without newlines).
-   * Splits long text into multiple <hp:run> elements within a single paragraph.
-   */
-  private updateTextInCellChunked(cellXml: string, newText: string, charShapeId?: number): string {
-    const charAttr = charShapeId !== undefined ? ` charPrIDRef="${charShapeId}"` : ' charPrIDRef="0"';
-    let xml = cellXml;
-
-    // Find the subList element to replace paragraph content
-    const subListStartMatch = xml.match(/<(hp|hs|hc):subList[^>]*>/);
-    if (subListStartMatch) {
-      const prefix = subListStartMatch[1];
-      const startTag = subListStartMatch[0];
-      const startIndex = xml.indexOf(startTag);
-      const contentStartIndex = startIndex + startTag.length;
-
-      // Find matching closing tag using balanced bracket counting
-      const openTag = `<${prefix}:subList`;
-      const closeTag = `</${prefix}:subList>`;
-      let depth = 1;
-      let searchIndex = contentStartIndex;
-      let contentEndIndex = -1;
-
-      while (depth > 0 && searchIndex < xml.length) {
-        const nextOpen = xml.indexOf(openTag, searchIndex);
-        const nextClose = xml.indexOf(closeTag, searchIndex);
-
-        if (nextClose === -1) break;
-
-        if (nextOpen !== -1 && nextOpen < nextClose) {
-          depth++;
-          searchIndex = nextOpen + openTag.length;
-        } else {
-          depth--;
-          if (depth === 0) {
-            contentEndIndex = nextClose;
-          }
-          searchIndex = nextClose + closeTag.length;
-        }
-      }
-
-      if (contentEndIndex !== -1) {
-        const subListContent = xml.substring(contentStartIndex, contentEndIndex);
-
-        // Preserve nested tables
-        const nestedTables = this.extractNestedTables(subListContent, prefix);
-
-        // Extract paraPrIDRef and styleIDRef from existing paragraph
-        const existingPMatch = subListContent.match(/<(?:hp|hs|hc):p[^>]*paraPrIDRef="([^"]*)"[^>]*styleIDRef="([^"]*)"/);
-        const paraPrIDRef = existingPMatch?.[1] || '0';
-        const styleIDRef = existingPMatch?.[2] || '0';
-
-        const paraId = Math.floor(Math.random() * 2147483647);
-
-        // Generate chunked runs for long text
-        const runsXml = this.generateChunkedRuns(newText, prefix, charAttr);
-
-        const newParagraph = `<${prefix}:p id="${paraId}" paraPrIDRef="${paraPrIDRef}" styleIDRef="${styleIDRef}" pageBreak="0" columnBreak="0" merged="0">${runsXml}<${prefix}:linesegarray><${prefix}:lineseg textpos="0" vertpos="0" vertsize="1000" textheight="1000" baseline="850" spacing="600" horzpos="0" horzsize="0" flags="0"/></${prefix}:linesegarray></${prefix}:p>`;
-
-        const newContent = newParagraph + nestedTables;
-        return xml.substring(0, contentStartIndex) + newContent + xml.substring(contentEndIndex);
-      }
-    }
-
-    // Fallback: try to find paragraph directly
-    const pStartMatch = xml.match(/<(hp|hs|hc):p[^>]*>/);
-    if (pStartMatch) {
-      const prefix = pStartMatch[1];
-      const attrMatch = pStartMatch[0].match(/<(?:hp|hs|hc):p([^>]*)>/);
-      const attrs = attrMatch?.[1] || ' id="0" paraPrIDRef="0" styleIDRef="0" pageBreak="0" columnBreak="0" merged="0"';
-
-      // Find extent of all paragraphs
-      const openTag = `<${prefix}:p`;
-      const closeTag = `</${prefix}:p>`;
-      const firstPStart = xml.indexOf(pStartMatch[0]);
-      let depth = 0;
-      let searchIndex = firstPStart;
-      let lastParagraphEnd = -1;
-
-      while (searchIndex < xml.length) {
-        const nextOpen = xml.indexOf(openTag, searchIndex);
-        const nextClose = xml.indexOf(closeTag, searchIndex);
-
-        if (depth === 0 && (nextOpen === -1 || (nextClose !== -1 && nextClose < nextOpen && xml.indexOf(openTag, searchIndex) === -1))) {
-          break;
-        }
-
-        if (nextOpen !== -1 && (nextClose === -1 || nextOpen < nextClose)) {
-          depth++;
-          searchIndex = nextOpen + openTag.length;
-        } else if (nextClose !== -1) {
-          depth--;
-          searchIndex = nextClose + closeTag.length;
-          if (depth === 0) {
-            lastParagraphEnd = searchIndex;
-            const remainingXml = xml.substring(searchIndex);
-            const nextPMatch = remainingXml.match(/^\s*<(hp|hs|hc):p[^>]*>/);
-            if (!nextPMatch) break;
-          }
-        } else {
-          break;
-        }
-      }
-
-      if (lastParagraphEnd !== -1) {
-        const contentToReplace = xml.substring(firstPStart, lastParagraphEnd);
-        const nestedTables = this.extractNestedTables(contentToReplace, prefix);
-
-        // Generate chunked runs
-        const runsXml = this.generateChunkedRuns(newText, prefix, charAttr);
-        const newParagraph = `<${prefix}:p${attrs}>${runsXml}<${prefix}:linesegarray><${prefix}:lineseg textpos="0" vertpos="0" vertsize="1000" textheight="1000" baseline="850" spacing="600" horzpos="0" horzsize="0" flags="0"/></${prefix}:linesegarray></${prefix}:p>`;
-
-        const newContent = newParagraph + nestedTables;
-        return xml.substring(0, firstPStart) + newContent + xml.substring(lastParagraphEnd);
-      }
-    }
-
-    // Final fallback
-    return xml;
-  }
-
-  /**
-   * Update text content in a cell with multiple paragraphs (for text with newlines).
-   * Each line becomes a separate <hp:p> element, allowing independent styling.
+   * Replace the entire content of a cell, one <hp:p> per line.
+   *
+   * This is the single code path for every cell text update (single- or
+   * multi-line, short or long). It clears all existing paragraphs/runs and
+   * rebuilds them, chunking long lines into multiple runs.
+   *
+   * Font: if `charShapeId` is given it is applied to every run; otherwise the
+   * cell's existing first-run `charPrIDRef` is preserved (so an update that
+   * omits the style does not reset the font to charPrIDRef="0" = 함초롬바탕 10pt).
    */
   private updateTextInCellMultiline(cellXml: string, newText: string, charShapeId?: number): string {
     const lines = newText.split('\n');
-    const charAttr = charShapeId !== undefined ? ` charPrIDRef="${charShapeId}"` : ' charPrIDRef="0"';
+    let charPrId = '0';
+    if (charShapeId !== undefined) {
+      charPrId = String(charShapeId);
+    } else {
+      // Preserve the cell's OWN first-run font. Strip nested <tbl>…</tbl> blocks
+      // first so a nested table's run (which may sit before OR after the cell's
+      // own paragraphs) is never picked up — and the cell's run is not lost when
+      // a nested table happens to precede it.
+      const topLevel = cellXml.replace(/<(hp|hs|hc):tbl\b[\s\S]*?<\/\1:tbl>/g, '');
+      const existingRun = topLevel.match(/<(?:hp|hs|hc):run[^>]*\bcharPrIDRef="([^"]*)"/);
+      if (existingRun) charPrId = existingRun[1];
+    }
+    const charAttr = ` charPrIDRef="${charPrId}"`;
 
     // Find the OUTER subList element with balanced tag matching
     // This is crucial because cells can contain nested tables with their own subLists
