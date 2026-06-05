@@ -54,6 +54,22 @@ for tpl in "$DIST_SKILL"/templates/*.hwpx; do
   template_count=$((template_count + 1))
 done
 shopt -u nullglob
+
+# macOS stores Hangul filenames as NFD (decomposed); an NFD entry inside the
+# .mcpb renders garbled on Windows AND breaks the skill's NFC filename match
+# (template lookup fails → Mode C fallback). Force every staged template to NFC.
+python3 - "$STAGE/assets" <<'PY'
+import os, sys, unicodedata
+d = sys.argv[1]
+for name in list(os.listdir(d)):
+    nfc = unicodedata.normalize("NFC", name)
+    if name != nfc:
+        tmp = os.path.join(d, "._nfc_tmp")
+        os.rename(os.path.join(d, name), tmp)  # drop NFD entry (APFS normalization-insensitive)
+        os.rename(tmp, os.path.join(d, nfc))   # recreate with NFC bytes
+        print(f"==> Normalized template filename NFD->NFC: {nfc}")
+PY
+
 if [ "$template_count" -eq 0 ]; then
   echo "ERROR: no .hwpx templates found in $DIST_SKILL/templates" >&2
   echo "       Set HWPX_DIST_SKILL to the folder whose templates/ holds the files." >&2
