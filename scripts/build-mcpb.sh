@@ -61,13 +61,29 @@ shopt -u nullglob
 python3 - "$STAGE/assets" <<'PY'
 import os, sys, unicodedata
 d = sys.argv[1]
-for name in list(os.listdir(d)):
+names = os.listdir(d)
+# Guard: two staged names that fold to the same NFC name would silently
+# overwrite each other on a normalization-sensitive FS (e.g. Linux CI),
+# dropping a template from the bundle. Fail loudly before touching anything.
+seen = {}
+for name in names:
     nfc = unicodedata.normalize("NFC", name)
-    if name != nfc:
-        tmp = os.path.join(d, "._nfc_tmp")
-        os.rename(os.path.join(d, name), tmp)  # drop NFD entry (APFS normalization-insensitive)
-        os.rename(tmp, os.path.join(d, nfc))   # recreate with NFC bytes
-        print(f"==> Normalized template filename NFD->NFC: {nfc}")
+    if nfc in seen:
+        sys.exit(f"ERROR: template filename collision under NFC: {seen[nfc]!r} vs {name!r}")
+    seen[nfc] = name
+for name in names:
+    nfc = unicodedata.normalize("NFC", name)
+    if name == nfc:
+        continue
+    src = os.path.join(d, name)
+    tmp = os.path.join(d, "._nfc_tmp")
+    os.rename(src, tmp)                        # drop NFD entry (APFS normalization-insensitive)
+    try:
+        os.rename(tmp, os.path.join(d, nfc))  # recreate with NFC bytes
+    except OSError:
+        os.rename(tmp, src)                   # restore original name, then surface the error
+        raise
+    print(f"==> Normalized template filename NFD->NFC: {nfc}")
 PY
 
 if [ "$template_count" -eq 0 ]; then
