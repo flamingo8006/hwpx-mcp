@@ -49,7 +49,7 @@ allowed-tools:
 
 | 사용자 발화 | 모드 | 템플릿 | 핵심 흐름 |
 |---|---|---|---|
-| "업무추진비 집행내역서", "○○ 양식 그대로 채워줘" | **(A) 폼필** | `업무추진비류_집행내역서_서식.hwpx` | Step 0 → **Step A-0(필수정보 역질문)** → **Step A-0.5(작성 내용 확인)** → open → batch_replace → update_table_cell(참석자) → save |
+| "업무추진비 집행내역서", "○○ 양식 그대로 채워줘" | **(A) 폼필** | `업무추진비류_집행내역서_서식.hwpx` | Step 0 → **Step A-0(필수정보 역질문)** → **Step A-0.5(작성 내용 확인)** → open → batch_replace → update_table_cell(참석자) → update_table_cell(회의내용) → save |
 | "공문서 서식으로 ○○ 보고", "DGIST 공문 양식으로" | **(B) 스타일팔레트** | `공문서_프레임.hwpx` | Step 0 → open → batch_replace(제목/날짜) + build_document(본문) → save |
 | 그 외 (보고서/회의록/안내문/계획서, 서식 언급 없음) | **(C) 자유** | — | create_document → build_document → save |
 
@@ -89,7 +89,7 @@ allowed-tools:
 > | 참석자 명단 | (`<소속A>`) 이름, 이름 / (`<소속B>`) 이름 … | 입력 |
 > | 참석자 총원 | **총 `<N>`명** | 🧮 계산 |
 > | 1인금액 | `<총액> ÷ <N> = <1인금액>원` | 🧮 계산 |
-> | 회의내용 1·2 | `<다듬은 한 줄>` | ✍️ 다듬음 |
+> | 회의내용 (가변 N줄) | - `<내용1>` / - `<내용2>` / … | ✍️ 다듬음 |
 > | 저장 위치 | `<Downloads>/<파일명>.hwpx` | — |
 >
 > 수정할 항목이 있으면 알려주세요. "이대로" 라고 하시면 바로 만들겠습니다.
@@ -101,14 +101,15 @@ allowed-tools:
 - 사용자가 최초 요청 또는 Step A-0 보완 응답에서 "확인 없이 바로 만들어"·"묻지 말고" 라고 했으면 이 단계를 건너뛴다.
 - **Mode B·C 에는 이 단계가 없다** (누락 시 자동 결정 후 진행 — 기존 철학 유지).
 
-**흐름** (MCP 5회 — Bash 불필요, Step A-0/A-0.5 통과 후):
+**흐름** (MCP 6회 — Bash 불필요, Step A-0/A-0.5 통과 후):
 1. `open_document({ file_path: <templates[i].path> })` → `{ doc_id }`  — 템플릿을 직접 연다 (원본은 save 시점에 다른 경로로 저장되므로 불변).
-2. `batch_replace({ doc_id, replacements: [ /* 참석자 제외 10개 placeholder */ ] })`  — 부서·사용자·일자·장소·목적·금액한글·금액·1인금액·회의내용1·2
+2. `batch_replace({ doc_id, replacements: [ /* 참석자·회의내용 제외 8개 placeholder */ ] })`  — 부서·사용자·일자·장소·목적·금액한글·금액·1인금액
 3. `update_table_cell({ doc_id, section_index: 0, table_index: 0, row: 4, col: 0, text: "<참석자 블록>", char_shape_id: 12, auto_hanging_indent: false })`  — 참석자 명단(인원·소속 가변 줄). 셀 전체를 다시 쓰므로 라벨("4. 참  석  자 :")까지 포함. **`char_shape_id: 12` 미지정 시 폰트가 함초롬바탕 10pt 로 깨짐.**
-4. `save_document({ doc_id, output_path: "<$PATHS.downloads>/<자동파일명>.hwpx" })`  — 원본 템플릿이 아닌 Downloads 에 저장됨.
-5. `close_document({ doc_id })`
+4. `update_table_cell({ doc_id, section_index: 0, table_index: 0, row: 6, col: 0, text: "<회의내용 블록>", char_shape_id: 12, auto_hanging_indent: false })`  — 회의내용(안건 수 가변 줄). 라벨("6. 회 의 내 용 :")부터 각 안건 " - 내용" 줄까지 포함. (C. 회의내용 블록 참조)
+5. `save_document({ doc_id, output_path: "<$PATHS.downloads>/<자동파일명>.hwpx" })`  — 원본 템플릿이 아닌 Downloads 에 저장됨.
+6. `close_document({ doc_id })`
 
-placeholder 목록·**참석자 블록 작성법**·**금액 표기 규칙**은 **`REFERENCE.md` 의 "Mode A placeholder" 섹션** 참조 필수.
+placeholder 목록·**참석자 블록 작성법**·**회의내용 블록 작성법**·**금액 표기 규칙**은 **`REFERENCE.md` 의 "Mode A placeholder" 섹션** 참조 필수.
 
 ---
 
