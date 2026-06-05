@@ -2417,7 +2417,7 @@ const server = new Server(
     // package.json 의 version 과 동기화 유지 (릴리스 시 함께 올릴 것).
     // JSON import 는 .mcpb 번들이 package.json 을 stage 루트에만 두고 dist/ 옆에는
     // 두지 않아 dist 기준 상대경로가 깨져 채택 X.
-    version: '0.5.4',
+    version: '0.5.5',
   },
   {
     capabilities: {
