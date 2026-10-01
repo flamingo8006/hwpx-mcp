@@ -38,6 +38,62 @@ export function resetLinesegInXml(xml: string): string {
   });
 }
 
+/**
+ * Collapse the <linesegarray> of every paragraph that owns one of `offsets`
+ * (positions inside the paragraph's own text, e.g. a changed <hp:t>) down to
+ * its first <lineseg> with textpos="0". Hancom re-lays out the paragraph when
+ * opening. Without this, a shrinking edit can leave a lineseg whose textpos
+ * points past the end of the paragraph text, which Hancom rejects as a
+ * corrupted document. The first lineseg's metrics (vertpos, vertsize, …) are
+ * kept so the paragraph keeps its vertical position and line height.
+ *
+ * Nested paragraphs (table cells inside a run) are skipped with a depth
+ * counter so a cell's linesegarray is never mistaken for the host paragraph's.
+ */
+export function collapseLinesegsAt(xml: string, offsets: number[]): string {
+  const targets = new Set<number>();
+  const tokenRe = /<(?:hp|hs|hc):p\b[^>]*?(\/?)>|<\/(?:hp|hs|hc):p>|<(?:hp|hs|hc):linesegarray\b/g;
+  for (const offset of offsets) {
+    tokenRe.lastIndex = offset;
+    let depth = 0;
+    let m: RegExpExecArray | null;
+    while ((m = tokenRe.exec(xml)) !== null) {
+      const tok = m[0];
+      if (tok.startsWith('</')) {
+        if (depth === 0) break; // owning paragraph has no linesegarray
+        depth--;
+      } else if (tok.includes(':linesegarray')) {
+        if (depth === 0) {
+          targets.add(m.index);
+          break;
+        }
+      } else if (m[1] !== '/') {
+        depth++;
+      }
+    }
+  }
+
+  // Rewrite back-to-front so earlier offsets stay valid.
+  let result = xml;
+  for (const start of [...targets].sort((a, b) => b - a)) {
+    const prefix = result.substring(start + 1, result.indexOf(':', start));
+    const closeTag = `</${prefix}:linesegarray>`;
+    const openEnd = result.indexOf('>', start);
+    const closeStart = result.indexOf(closeTag, openEnd);
+    if (openEnd === -1 || closeStart === -1 || result[openEnd - 1] === '/') continue;
+
+    const inner = result.substring(openEnd + 1, closeStart);
+    const first = inner.match(new RegExp(`<${prefix}:lineseg\\b[^>]*/>`));
+    const collapsed = first
+      ? (/\btextpos="[^"]*"/.test(first[0])
+        ? first[0].replace(/\btextpos="[^"]*"/, 'textpos="0"')
+        : first[0].replace(`<${prefix}:lineseg`, `<${prefix}:lineseg textpos="0"`))
+      : `<${prefix}:lineseg textpos="0" vertpos="0" vertsize="1000" textheight="1000" baseline="850" spacing="600" horzpos="0" horzsize="0" flags="0"/>`;
+    result = result.substring(0, openEnd + 1) + collapsed + result.substring(closeStart);
+  }
+  return result;
+}
+
 export interface TopLevelElement {
   start: number;
   tagLength: number;

@@ -6,6 +6,7 @@ import {
   escapeXml as _escapeXml,
   escapeRegex as _escapeRegex,
   resetLinesegInXml as _resetLinesegInXml,
+  collapseLinesegsAt,
   findTopLevelElements as _findTopLevelElements,
   findAllElementsWithDepth as _findAllElementsWithDepth,
 } from './xml/XmlUtils';
@@ -176,6 +177,9 @@ export class HwpxDocument {
 
   // Original charPr count for integrity validation
   private _originalCharPrCount?: number;
+  // Original ZIP entries in archive order → compression method, captured at
+  // load so save() can reproduce the container layout (see normalizeZipLayout).
+  private _originalZipEntries?: Map<string, 'STORE' | 'DEFLATE'>;
 
   private constructor(id: string, path: string, zip: JSZip | null, content: HwpxContent, format: DocumentFormat) {
     this._id = id;
@@ -241,8 +245,12 @@ export class HwpxDocument {
       return new HwpxDocument(id, path, null, content, 'hwp');
     } else {
       const zip = await JSZip.loadAsync(data);
+      // Capture before parsing: HwpxParser calls zip.folder(), which adds
+      // directory entries that are not part of the original archive.
+      const originalZipEntries = HwpxDocument.captureZipEntries(zip);
       const content = await HwpxParser.parse(zip);
       const doc = new HwpxDocument(id, path, zip, content, 'hwpx');
+      doc._originalZipEntries = originalZipEntries;
 
       // Store original charPr count for integrity validation
       const headerXml = await zip.file('Contents/header.xml')?.async('string');
@@ -5364,6 +5372,8 @@ export class HwpxDocument {
       this._zip.file('mimetype', mimetypeContent, { compression: 'STORE' });
     }
 
+    this.normalizeZipLayout();
+
     const buffer = await this._zip.generateAsync({
       type: 'nodebuffer',
       compression: 'DEFLATE',
@@ -5376,6 +5386,46 @@ export class HwpxDocument {
     this._crossSectionMoveAudit = [];
 
     return buffer;
+  }
+
+  private static captureZipEntries(zip: JSZip): Map<string, 'STORE' | 'DEFLATE'> {
+    const entries = new Map<string, 'STORE' | 'DEFLATE'>();
+    for (const [name, file] of Object.entries(zip.files)) {
+      // JSZip keeps the loaded entry's method on its compressed payload.
+      const magic = (file as any)._data?.compression?.magic;
+      entries.set(name, magic === '\x00\x00' ? 'STORE' : 'DEFLATE');
+    }
+    return entries;
+  }
+
+  /**
+   * Make the saved archive follow the original container layout (OCF-style
+   * HWPX as written by Hancom): original entries keep their order and their
+   * own compression method (e.g. version.xml / PrvImage.png stay STORED), and
+   * directory entries JSZip auto-creates on `zip.file('a/b', …)` are dropped
+   * unless the original had them. Entries added by edits (e.g. new BinData)
+   * follow in insertion order with the default DEFLATE.
+   */
+  private normalizeZipLayout(): void {
+    const original = this._originalZipEntries;
+    if (!this._zip || !original) return;
+    const files = this._zip.files;
+    const reordered: Record<string, JSZip.JSZipObject> = {};
+    for (const [name, method] of original) {
+      const file = files[name];
+      if (!file) continue;
+      // mimetype must always be STORED (container requirement), even if the
+      // original archive got it wrong.
+      if (!file.dir) (file as any).options.compression = name === 'mimetype' ? 'STORE' : method;
+      reordered[name] = file;
+    }
+    for (const [name, file] of Object.entries(files)) {
+      if (name in reordered) continue;
+      if (file.dir) continue; // auto-created folder entry
+      reordered[name] = file;
+    }
+    for (const name of Object.keys(files)) delete files[name];
+    Object.assign(files, reordered);
   }
 
   // WARNING: syncContentToZip reads and writes header.xml and section XML files sequentially.
@@ -10810,6 +10860,19 @@ export class HwpxDocument {
   private async applyTextReplacementsToXml(): Promise<void> {
     if (!this._zip) return;
 
+    // Same pattern construction as replaceText(); invalid regexes were already
+    // rejected there, so skipping them here is purely defensive.
+    const patterns: Array<{ pattern: RegExp; newText: string }> = [];
+    for (const { oldText, newText, options } of this._pendingTextReplacements) {
+      const { caseSensitive = false, regex = false, replaceAll = true } = options;
+      const flags = caseSensitive ? (replaceAll ? 'g' : '') : (replaceAll ? 'gi' : 'i');
+      try {
+        patterns.push({ pattern: new RegExp(regex ? oldText : this.escapeRegex(oldText), flags), newText });
+      } catch {
+        continue;
+      }
+    }
+
     // Get all section files
     let sectionIndex = 0;
     while (true) {
@@ -10817,43 +10880,83 @@ export class HwpxDocument {
       const file = this._zip.file(sectionPath);
       if (!file) break;
 
-      let xml = await file.async('string');
+      const xml = await file.async('string');
 
-      // Apply each pending replacement to the XML
-      for (const replacement of this._pendingTextReplacements) {
-        const { oldText, newText, options } = replacement;
-        const { caseSensitive = false, regex = false, replaceAll = true } = options;
-
-        // Create pattern for matching text inside <hp:t> tags
-        let searchPattern: RegExp;
-        if (regex) {
-          try {
-            searchPattern = new RegExp(oldText, caseSensitive ? (replaceAll ? 'g' : '') : (replaceAll ? 'gi' : 'i'));
-          } catch {
-            continue; // Skip invalid regex patterns
-          }
+      // Walk every <hp:t> (including ones that contain child elements such as
+      // <hp:lineBreak/>, <hp:tab/>, markpen tags) and apply all pending
+      // replacements to each top-level text segment between child elements.
+      // This mirrors HwpxParser, which turns each such segment into its own
+      // in-memory run — so whatever replaceText() matched and counted in
+      // memory is exactly what gets rewritten here. (Previously only
+      // `<hp:t>[^<]*</hp:t>` was matched, silently dropping replacements in
+      // <hp:t> elements with children while still reporting success.)
+      const tRe = /<hp:t(\s[^>]*)?>([\s\S]*?)<\/hp:t>/g;
+      let out = '';
+      let last = 0;
+      const changedOffsets: number[] = [];
+      let m: RegExpExecArray | null;
+      while ((m = tRe.exec(xml)) !== null) {
+        const newInner = this.replaceInTextContent(m[2], patterns);
+        out += xml.substring(last, m.index);
+        if (newInner !== m[2]) {
+          changedOffsets.push(out.length);
+          out += `<hp:t${m[1] || ''}>${newInner}</hp:t>`;
         } else {
-          const escaped = oldText.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-          searchPattern = new RegExp(escaped, caseSensitive ? (replaceAll ? 'g' : '') : (replaceAll ? 'gi' : 'i'));
+          out += m[0];
         }
-
-        // Replace text within <hp:t> tags while preserving XML structure
-        // First unescape XML entities so search patterns match raw text, then re-escape
-        xml = xml.replace(/<hp:t([^>]*)>([^<]*)<\/hp:t>/g, (_match, attrs, textContent) => {
-          const unescaped = textContent
-            .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
-            .replace(/&quot;/g, '"').replace(/&apos;/g, "'");
-          const replaced = unescaped.replace(searchPattern, newText);
-          return `<hp:t${attrs}>${this.escapeXml(replaced)}</hp:t>`;
-        });
+        last = m.index + m[0].length;
       }
+      out += xml.substring(last);
 
-      this._zip.file(sectionPath, xml);
+      if (changedOffsets.length > 0) {
+        // Text length changed → the old lineseg layout no longer matches.
+        // A shrunk paragraph whose lineseg textpos exceeds its text length
+        // makes Hancom refuse to open the file, so collapse to one lineseg.
+        this._zip.file(sectionPath, collapseLinesegsAt(out, changedOffsets));
+      }
       sectionIndex++;
     }
 
     // Update metadata in header.xml if needed
     await this.syncMetadataToZip();
+  }
+
+  /**
+   * Apply replacement patterns to the inner content of one <hp:t>.
+   *
+   * The content is split at child elements (<hp:lineBreak/>, <hp:tab/>, …),
+   * matching how HwpxParser splits it into runs; each top-level text segment
+   * is decoded, replaced, and re-escaped. Text nested inside non-empty child
+   * elements (e.g. <hp:compose>) is left alone. Segments that do not change
+   * are emitted byte-for-byte, so untouched entities are never re-escaped.
+   */
+  private replaceInTextContent(inner: string, patterns: Array<{ pattern: RegExp; newText: string }>): string {
+    const parts = inner.split(/(<[^>]+>)/);
+    let depth = 0;
+    for (let i = 0; i < parts.length; i++) {
+      const part = parts[i];
+      if (i % 2 === 1) {
+        if (part.startsWith('</')) depth = Math.max(0, depth - 1);
+        else if (!part.endsWith('/>')) depth++;
+        continue;
+      }
+      // Empty segments between child elements produce no run in the parser,
+      // but an entirely empty <hp:t></hp:t> does (so e.g. regex '^' matches).
+      if (depth > 0 || (part === '' && parts.length > 1)) continue;
+
+      // Decode exactly like HwpxParser.decodeXmlEntities so the save path
+      // matches the same text replaceText() matched in memory.
+      const decoded = part
+        .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+        .replace(/&quot;/g, '"').replace(/&apos;/g, "'");
+      let replaced = decoded;
+      for (const { pattern, newText } of patterns) {
+        pattern.lastIndex = 0;
+        replaced = replaced.replace(pattern, newText);
+      }
+      if (replaced !== decoded) parts[i] = this.escapeXml(replaced);
+    }
+    return parts.join('');
   }
 
   /**
